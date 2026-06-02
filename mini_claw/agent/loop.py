@@ -397,6 +397,7 @@ async def run_agent_step(
                     "id": tc.id,
                     "name": tc.name,
                     "arguments": tc.arguments,
+                    "level": decision.permission_level,  # Phase 0.3: for approval card
                 })
                 run.status = RunOutcome.SUSPENDED
                 return run

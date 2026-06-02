@@ -149,13 +149,26 @@ class Gateway:
 
         # Send approval card if suspended
         if run.status == RunOutcome.SUSPENDED and run.pending_approval_id:
-            # TODO: Implement approval card sending
-            # For now, just log that approval is needed
-            logger.info(
-                "Run %s suspended, pending approval %s",
-                run_id,
-                run.pending_approval_id,
-            )
+            # Phase 0.3: Send approval card to channel (Phase 0 阶段沿用
+            # self._channel；Phase 2 完成后统一改为 channel_manager 路由)
+            if run.pending_tool_call:
+                try:
+                    pending = json.loads(run.pending_tool_call)
+                    tool_name = pending.get("name", "unknown")
+                    tool_args = pending.get("arguments", {})
+                    level = pending.get("level", "L3")  # fallback to L3
+                    await channel.send_approval_card(
+                        chat_id, run.pending_approval_id, tool_name, tool_args, level
+                    )
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning(
+                        "Failed to parse pending_tool_call for approval card: %s", exc
+                    )
+            else:
+                logger.warning(
+                    "Run %s suspended but no pending_tool_call to build card",
+                    run_id,
+                )
 
         # Persist run state to agent_runs table
         now = int(time.time())

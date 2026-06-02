@@ -7,7 +7,7 @@ Run ``mini-claw setup`` in your project directory to generate it.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -31,6 +31,26 @@ def get_data_dir(config_path: Path | None = None) -> Path:
     self-contained.
     """
     return get_config_path(config_path).parent
+
+
+class ConcurrencyConfig(BaseModel):
+    """Concurrency and locking configuration.
+
+    For single-process deployments, use default settings.
+    For multi-process deployments, set lock_backend to 'file' and cache_mode to 'db'.
+    """
+
+    lock_backend: Literal["asyncio", "file", "sqlite"] = "asyncio"
+    """Lock backend: 'asyncio' (single-process), 'file' (multi-process), 'sqlite' (cross-platform multi-process)."""
+
+    cache_mode: Literal["memory", "db"] = "memory"
+    """Cache mode: 'memory' (single-process), 'db' (multi-process, disables in-memory cache)."""
+
+    file_lock_dir: str = "./data/locks"
+    """Directory for file locks (only used when lock_backend='file')."""
+
+    lock_timeout: float = 30.0
+    """Lock acquisition timeout in seconds."""
 
 
 class ProviderConfig(BaseModel):
@@ -197,6 +217,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
+    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     agents_defaults: AgentConfig | None = None
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
 

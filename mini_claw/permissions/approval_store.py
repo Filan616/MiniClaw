@@ -14,11 +14,18 @@ class ApprovalStore:
     Architecture: Separates storage concerns from decision logic (PermissionGate).
     PermissionGate calls ApprovalStore for create/resolve/grant operations.
     This keeps PermissionGate as a pure decision function.
+
+    Args:
+        storage: Database instance
+        enable_cache: If True, cache session grants in memory (default True).
+                     Set to False for multi-process deployments to avoid cache inconsistency.
     """
 
-    def __init__(self, storage: Any) -> None:
+    def __init__(self, storage: Any, enable_cache: bool = True) -> None:
         self._storage = storage
+        self._enable_cache = enable_cache
         # In-memory cache for hot-path reads (session grants)
+        # Only used if enable_cache=True (single-process deployment)
         self._grants_cache: dict[tuple[str, str, str], int] = {}  # (chat_id, agent_id, tool) -> expires_at
 
     # ------------------------------------------------------------------
@@ -176,9 +183,10 @@ class ApprovalStore:
             "VALUES (?, ?, ?, ?)",
             (chat_id, agent_id, tool_name, expires_at),
         )
-        # Update cache
-        cache_key = (chat_id, agent_id, tool_name)
-        self._grants_cache[cache_key] = expires_at or 0
+        # Update cache if enabled
+        if self._enable_cache:
+            cache_key = (chat_id, agent_id, tool_name)
+            self._grants_cache[cache_key] = expires_at or 0
 
     def has_session_grant(self, chat_id: str, agent_id: str, tool_name: str) -> bool:
         """Check if an active session grant exists for a tool.
@@ -193,8 +201,8 @@ class ApprovalStore:
         """
         cache_key = (chat_id, agent_id, tool_name)
 
-        # Check cache first
-        if cache_key in self._grants_cache:
+        # Check cache first if enabled
+        if self._enable_cache and cache_key in self._grants_cache:
             expires_at = self._grants_cache[cache_key]
             if expires_at == 0 or expires_at > int(time.time()):
                 return True
@@ -203,7 +211,7 @@ class ApprovalStore:
                 del self._grants_cache[cache_key]
                 return False
 
-        # Cache miss, query database
+        # Cache miss or cache disabled, query database
         record = self._storage.fetchone(
             "SELECT expires_at FROM session_grants "
             "WHERE chat_id = ? AND agent_id = ? AND tool_name = ?",
@@ -213,8 +221,9 @@ class ApprovalStore:
             return False
 
         expires_at = record["expires_at"]
-        # Populate cache
-        self._grants_cache[cache_key] = expires_at or 0
+        # Populate cache if enabled
+        if self._enable_cache:
+            self._grants_cache[cache_key] = expires_at or 0
 
         # Check expiry
         if expires_at is None or expires_at > int(time.time()):

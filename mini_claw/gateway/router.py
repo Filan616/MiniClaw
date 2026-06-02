@@ -18,6 +18,7 @@ from mini_claw.channels.base import Channel, InboundMessage
 from mini_claw.commands.bypass import handle_bypass_command
 from mini_claw.config import AgentConfig, AppConfig
 from mini_claw.gateway.session import SessionManager
+from mini_claw.permissions.chain_detector import ChainDetector
 from mini_claw.providers.base import Provider
 from mini_claw.storage.db import Database
 from mini_claw.tools.registry import ToolRegistry
@@ -65,6 +66,7 @@ class Gateway:
         self._workspace_manager = workspace_manager
         self._session_mgr = SessionManager(storage)
         self._audit_logger = SecurityAuditLogger(storage)
+        self._chain_detector = ChainDetector()
         self._dedup_lock = asyncio.Lock()  # Protects processed_events INSERT
         self._workspace_locks: dict[str, asyncio.Lock] = {}  # Per-workspace concurrency control
         self._channel: Channel | None = None
@@ -352,6 +354,7 @@ class Gateway:
                 channel=channel,
                 sandbox_mode=sandbox_mode,
                 audit_logger=self._audit_logger,
+                chain_detector=self._chain_detector,
             )
 
             # Load conversation history for context
@@ -463,6 +466,7 @@ class Gateway:
             channel=channel,
             sandbox_mode=sandbox_mode,
             audit_logger=self._audit_logger,
+            chain_detector=self._chain_detector,
         )
 
         history = self._session_mgr.get_history(

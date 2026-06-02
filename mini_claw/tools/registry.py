@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
@@ -28,13 +27,19 @@ class Tool:
 
 @dataclass(slots=True)
 class ToolContext:
-    """Runtime context passed to tool handlers."""
+    """Runtime context passed to tool handlers.
+
+    The audit_logger is injected by Gateway/router to allow tools to log
+    security events without directly importing storage layer.
+    """
 
     workspace_dir: Path
     chat_id: str = ""
     agent_id: str = ""
     timeout: int = 30
     sandbox_mode: str = "safe"  # "safe" or "bypass"
+    audit_logger: Any = None  # SecurityAuditLogger instance (TYPE_CHECKING avoided for simplicity)
+    chain_detector: Any = None  # ChainDetector instance
 
 
 class ToolRegistry:

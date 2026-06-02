@@ -218,6 +218,123 @@ class Database:
             except sqlite3.OperationalError:
                 pass
 
+        # Migration 7 (Phase C6): Session composite primary key.
+        # Rebuild sessions table with composite PK (channel_name, chat_id, agent_id)
+        # to support same chat_id across different channels.
+        # Also drop messages FK to sessions(chat_id) since chat_id is no longer PK.
+        try:
+            # Backfill NULL channel_name first
+            self._conn.execute(
+                "UPDATE sessions SET channel_name='feishu' WHERE channel_name IS NULL"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Check if messages table has the FK that references the old sessions(chat_id) PK
+        try:
+            cursor = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'"
+            )
+            row = cursor.fetchone()
+            if row and "REFERENCES sessions" in (row[0] or ""):
+                # Rebuild messages table without the FK
+                self._conn.executescript("""
+                    ALTER TABLE messages RENAME TO messages_old;
+
+                    CREATE TABLE messages (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id      TEXT NOT NULL,
+                        agent_id     TEXT NOT NULL,
+                        run_id       TEXT,
+                        role         TEXT NOT NULL,
+                        content      TEXT,
+                        tool_calls   TEXT,
+                        tool_call_id TEXT,
+                        created_at   INTEGER,
+                        compacted    INTEGER DEFAULT 0,
+                        is_compaction_summary INTEGER DEFAULT 0
+                    );
+
+                    INSERT INTO messages
+                        (id, chat_id, agent_id, run_id, role, content,
+                         tool_calls, tool_call_id, created_at, compacted, is_compaction_summary)
+                    SELECT id, chat_id, agent_id, run_id, role, content,
+                           tool_calls, tool_call_id, created_at,
+                           COALESCE(compacted, 0), COALESCE(is_compaction_summary, 0)
+                    FROM messages_old;
+
+                    DROP TABLE messages_old;
+
+                    CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id, id);
+                """)
+                self._conn.commit()
+        except sqlite3.OperationalError:
+            self._conn.rollback()
+
+        # Check if migration already applied (composite index exists)
+        cursor = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sessions_composite'"
+        )
+        composite_index_exists = cursor.fetchone() is not None
+
+        if not composite_index_exists:
+            # Check if sessions table has chat_id as sole PK (old schema)
+            cursor = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+            )
+            row = cursor.fetchone()
+            if row and "chat_id      TEXT PRIMARY KEY" in row[0]:
+                # Rebuild with composite UNIQUE constraint instead of changing PK
+                # (changing PK requires full table rebuild; using UNIQUE is safer)
+                try:
+                    self._conn.executescript("""
+                        ALTER TABLE sessions RENAME TO sessions_old;
+
+                        CREATE TABLE sessions (
+                            chat_id      TEXT NOT NULL,
+                            agent_id     TEXT NOT NULL,
+                            created_at   INTEGER,
+                            updated_at   INTEGER,
+                            channel_name TEXT NOT NULL DEFAULT 'feishu',
+                            thread_id    TEXT DEFAULT NULL,
+                            sandbox_mode_override TEXT,
+                            sandbox_mode_expires_at INTEGER,
+                            sandbox_mode_persistent INTEGER DEFAULT 0,
+                            sandbox_mode_single_use INTEGER DEFAULT 0,
+                            PRIMARY KEY (channel_name, chat_id, agent_id)
+                        );
+
+                        INSERT INTO sessions
+                            (chat_id, agent_id, created_at, updated_at, channel_name, thread_id,
+                             sandbox_mode_override, sandbox_mode_expires_at,
+                             sandbox_mode_persistent, sandbox_mode_single_use)
+                        SELECT chat_id, agent_id, created_at, updated_at,
+                               COALESCE(channel_name, 'feishu'), thread_id,
+                               sandbox_mode_override, sandbox_mode_expires_at,
+                               COALESCE(sandbox_mode_persistent, 0),
+                               COALESCE(sandbox_mode_single_use, 0)
+                        FROM sessions_old;
+
+                        DROP TABLE sessions_old;
+
+                        CREATE UNIQUE INDEX idx_sessions_composite
+                        ON sessions(channel_name, chat_id, COALESCE(thread_id, ''));
+                    """)
+                    self._conn.commit()
+                except sqlite3.OperationalError:
+                    self._conn.rollback()
+            else:
+                # Fresh table or already migrated, just add the index if missing
+                try:
+                    self._conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_composite "
+                        "ON sessions(channel_name, chat_id, COALESCE(thread_id, ''))"
+                    )
+                    self._conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
@@ -304,13 +421,14 @@ class Database:
 _SCHEMA_SQL = """\
 -- Basic group
 CREATE TABLE IF NOT EXISTS sessions (
-    chat_id      TEXT PRIMARY KEY,
+    chat_id      TEXT NOT NULL,
     agent_id     TEXT NOT NULL,
     created_at   INTEGER,
     updated_at   INTEGER,
-    channel_name TEXT DEFAULT 'feishu',
+    channel_name TEXT NOT NULL DEFAULT 'feishu',
     thread_id    TEXT DEFAULT NULL,
-    sandbox_mode_override TEXT  -- "safe", "bypass", or NULL (use config default)
+    sandbox_mode_override TEXT,  -- "safe", "bypass", or NULL (use config default)
+    PRIMARY KEY (channel_name, chat_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -322,8 +440,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content      TEXT,
     tool_calls   TEXT,
     tool_call_id TEXT,
-    created_at   INTEGER,
-    FOREIGN KEY (chat_id) REFERENCES sessions(chat_id)
+    created_at   INTEGER
+    -- Phase C6: removed FK to sessions(chat_id) since sessions now has composite PK
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id, id);

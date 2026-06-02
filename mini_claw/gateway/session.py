@@ -31,22 +31,24 @@ class SessionManager:
     ) -> dict[str, Any]:
         """Get an existing session or create a new one.
 
+        Sessions are scoped by (channel_name, chat_id, agent_id) to support
+        the same chat_id appearing on different channels independently.
+
         Returns a dict with session metadata.
         """
         row = self._storage.fetchone(
-            "SELECT * FROM sessions WHERE chat_id = ? AND agent_id = ?",
-            (chat_id, agent_id),
+            "SELECT * FROM sessions WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (channel_name, chat_id, agent_id),
         )
         if row is not None:
             # Update last activity
             now = int(time.time())
             self._storage.execute(
-                "UPDATE sessions SET updated_at = ?, channel_name = ? "
-                "WHERE chat_id = ? AND agent_id = ?",
+                "UPDATE sessions SET updated_at = ? "
+                "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
                 (now, channel_name, chat_id, agent_id),
             )
             row["updated_at"] = now
-            row["channel_name"] = channel_name
             return row
 
         now = int(time.time())
@@ -79,10 +81,9 @@ class SessionManager:
             "sandbox_mode_expires_at = NULL, "
             "sandbox_mode_single_use = 0, "
             "sandbox_mode_persistent = 0, "
-            "channel_name = ?, "
             "updated_at = ? "
-            "WHERE chat_id = ? AND agent_id = ?",
-            (mode, channel_name, int(time.time()), chat_id, agent_id),
+            "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (mode, int(time.time()), channel_name, chat_id, agent_id),
         )
 
     def get_sandbox_mode(
@@ -90,8 +91,9 @@ class SessionManager:
     ) -> str | None:
         """Get sandbox_mode_override for a session, or None if not set."""
         row = self._storage.fetchone(
-            "SELECT sandbox_mode_override FROM sessions WHERE chat_id = ? AND agent_id = ?",
-            (chat_id, agent_id),
+            "SELECT sandbox_mode_override FROM sessions "
+            "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (channel_name, chat_id, agent_id),
         )
         return row["sandbox_mode_override"] if row else None
 
@@ -115,27 +117,19 @@ class SessionManager:
         """
         self._storage.execute(
             "UPDATE sessions SET sandbox_mode_override = ?, "
-            "sandbox_mode_expires_at = ?, channel_name = ?, updated_at = ? "
-            "WHERE chat_id = ? AND agent_id = ?",
-            (mode, expires_at, channel_name, int(time.time()), chat_id, agent_id),
+            "sandbox_mode_expires_at = ?, updated_at = ? "
+            "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (mode, expires_at, int(time.time()), channel_name, chat_id, agent_id),
         )
 
     def clear_single_use_bypass(
         self, chat_id: str, agent_id: str, channel_name: str = "feishu"
     ) -> None:
-        """Clear single-use bypass after consumption.
-
-        Reads the current sandbox-mode override row and, if it represents a
-        single-use grant (``sandbox_mode_single_use=1`` or the legacy
-        ``sandbox_mode_expires_at=0`` sentinel), wipes the override, the
-        expiry, and the single-use flag in one update. Any other state
-        (persistent overrides, future-dated TTL, no override at all) is left
-        untouched.
-        """
+        """Clear single-use bypass after consumption."""
         row = self._storage.fetchone(
             "SELECT sandbox_mode_single_use, sandbox_mode_expires_at "
-            "FROM sessions WHERE chat_id = ? AND agent_id = ?",
-            (chat_id, agent_id),
+            "FROM sessions WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (channel_name, chat_id, agent_id),
         )
         if row and (
             row.get("sandbox_mode_single_use")
@@ -145,33 +139,18 @@ class SessionManager:
                 "UPDATE sessions SET sandbox_mode_override = NULL, "
                 "sandbox_mode_expires_at = NULL, sandbox_mode_single_use = 0, "
                 "updated_at = ? "
-                "WHERE chat_id = ? AND agent_id = ?",
-                (int(time.time()), chat_id, agent_id),
+                "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+                (int(time.time()), channel_name, chat_id, agent_id),
             )
 
     def get_effective_sandbox_mode(
         self, chat_id: str, agent_id: str, channel_name: str = "feishu"
     ) -> str:
-        """Return the effective sandbox mode, applying TTL semantics.
-
-        Rules:
-            * If no override is set, returns "safe" (default).
-            * If ``expires_at == 0`` (single-use sentinel), returns the
-              stored mode unchanged. Caller is responsible for clearing
-              after consumption.
-            * If ``expires_at`` is NULL, returns the stored mode unchanged
-              (persistent override).
-            * If ``expires_at`` is in the future, returns "bypass".
-            * If ``expires_at`` has elapsed, resets the row to "safe" and
-              clears the expiry, then returns "safe".
-
-        Returns:
-            "safe" or "bypass".
-        """
+        """Return the effective sandbox mode, applying TTL semantics."""
         row = self._storage.fetchone(
             "SELECT sandbox_mode_override, sandbox_mode_expires_at "
-            "FROM sessions WHERE chat_id = ? AND agent_id = ?",
-            (chat_id, agent_id),
+            "FROM sessions WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (channel_name, chat_id, agent_id),
         )
         if row is None:
             return "safe"
@@ -198,8 +177,8 @@ class SessionManager:
         self._storage.execute(
             "UPDATE sessions SET sandbox_mode_override = 'safe', "
             "sandbox_mode_expires_at = NULL, updated_at = ? "
-            "WHERE chat_id = ? AND agent_id = ?",
-            (now, chat_id, agent_id),
+            "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (now, channel_name, chat_id, agent_id),
         )
         return "safe"
 

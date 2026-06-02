@@ -3,52 +3,40 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from mini_claw.permissions.approval_store import ApprovalStore
 from mini_claw.permissions.levels import L3, L4
 from mini_claw.permissions.policy import PermissionPolicy
 
 
 @dataclass(frozen=True)
 class Decision:
-    """Result of a permission evaluation."""
+    """Result of a permission evaluation.
+
+    Architecture: PermissionGate returns Decision objects with audit_event field;
+    Gateway/tools receive these and call SecurityAuditLogger.log_security_event()
+    to keep PermissionGate independent of storage layer.
+    """
 
     action: str  # "allow" | "deny" | "need_approval"
-    reason: str = ""
-
-
-@dataclass
-class _SessionGrant:
-    """Temporary per-session permission grant."""
-
-    tool_name: str
-    expires_at: datetime
-
-
-@dataclass
-class _PendingApproval:
-    """A pending approval record awaiting human decision."""
-
-    approval_id: str
-    run_id: str
-    chat_id: str
-    agent_id: str
-    tool_call: Dict[str, Any]
-    created_at: datetime
-    expires_at: datetime
-    status: str = "pending"  # pending | approved | rejected | expired
+    reason: str = ""  # Message shown to LLM (may contain {debug_id} placeholder)
+    internal_reason: str = ""  # Detailed reason for logs (not shown to LLM)
+    audit_event: Optional[Dict[str, Any]] = None  # {"event_type": ..., ...}, written by Gateway
 
 
 class PermissionGate:
     """Pure decision gate — evaluates tool calls, never blocks."""
 
-    def __init__(self, policy: PermissionPolicy, storage: Any = None) -> None:
+    def __init__(
+        self,
+        policy: PermissionPolicy,
+        approval_store: ApprovalStore,
+    ) -> None:
         self._policy = policy
-        self._storage = storage
-        self._session_grants: list[_SessionGrant] = []
-        self._pending: dict[str, _PendingApproval] = {}
+        self._approval_store = approval_store
 
     # ------------------------------------------------------------------
     # Core evaluation
@@ -69,8 +57,20 @@ class PermissionGate:
         sandbox_mode = ctx.get("sandbox_mode", "safe")
 
         # 1. Blacklist check (always-on safety net, even in bypass mode).
-        if cmd and self._policy.is_blacklisted(cmd):
-            return Decision(action="deny", reason=f"command matches blacklist: {cmd!r}")
+        if cmd:
+            matched_pattern = self._policy.first_blacklist_match(cmd)
+            if matched_pattern:
+                return Decision(
+                    action="deny",
+                    reason="command blocked by security policy. debug_id={debug_id}",
+                    internal_reason=f"matched blacklist pattern: {matched_pattern!r}",
+                    audit_event={
+                        "event_type": "blacklist_hit",
+                        "cmd": cmd,
+                        "matched_pattern": matched_pattern,
+                        "tool": tool,
+                    },
+                )
 
         # In bypass mode, skip the sensitive-file and workspace-escape checks.
         # The user has explicitly opted to give the agent full filesystem access.
@@ -84,10 +84,16 @@ class PermissionGate:
                         continue
                     return Decision(
                         action="deny",
-                        reason=f"path matches sensitive-file pattern: {cp!r}",
+                        reason="access denied. debug_id={debug_id}",
+                        internal_reason=f"sensitive path: {cp!r}",
+                        audit_event={
+                            "event_type": "sensitive_path",
+                            "path": cp,
+                            "tool": tool,
+                        },
                     )
 
-            # 3. Path escape check
+            # 3. Path escape check (semi-obfuscated, no audit)
             path = args.get("path", args.get("file", ""))
             workspace_dir = ctx.get("workspace_dir")
             if path and workspace_dir:
@@ -95,7 +101,8 @@ class PermissionGate:
                 if not self._policy.path_in_workspace(path, _Path(workspace_dir)):
                     return Decision(
                         action="deny",
-                        reason=f"path escapes workspace: {path!r}",
+                        reason="path outside workspace",
+                        internal_reason=f"path escapes workspace: {path!r}",
                     )
 
         # 4. L4 deny-by-default (unless template match)
@@ -106,7 +113,9 @@ class PermissionGate:
 
         # 5. L3 require confirmation (unless session grant)
         if level in self._policy.config.require_confirm:
-            if self._has_session_grant(tool):
+            chat_id = ctx.get("chat_id", "")
+            agent_id = ctx.get("agent_id", "")
+            if self._has_session_grant(chat_id, agent_id, tool):
                 return Decision(action="allow", reason="session grant active")
             return Decision(action="need_approval", reason=f"level {level} requires confirmation")
 
@@ -136,16 +145,17 @@ class PermissionGate:
         """
         approval_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc)
-        record = _PendingApproval(
+        expires_at = int((now + timedelta(seconds=ttl)).timestamp())
+
+        self._approval_store.create_pending(
             approval_id=approval_id,
             run_id=run_id,
             chat_id=chat_id,
             agent_id=agent_id,
-            tool_call=tool_call,
-            created_at=now,
-            expires_at=now + timedelta(seconds=ttl),
+            tool_name=tool_call.get("tool", ""),
+            tool_args=tool_call.get("args", {}),
+            expires_at=expires_at,
         )
-        self._pending[approval_id] = record
         return approval_id
 
     def resolve(self, approval_id: str, decision: str) -> Optional[dict]:
@@ -158,24 +168,7 @@ class PermissionGate:
         Returns:
             The resolved record as a dict, or None if not found / already resolved.
         """
-        record = self._pending.get(approval_id)
-        if record is None or record.status != "pending":
-            return None
-
-        now = datetime.now(timezone.utc)
-        if now >= record.expires_at:
-            record.status = "expired"
-        else:
-            record.status = decision
-
-        return {
-            "approval_id": record.approval_id,
-            "status": record.status,
-            "tool_call": record.tool_call,
-            "run_id": record.run_id,
-            "chat_id": record.chat_id,
-            "agent_id": record.agent_id,
-        }
+        return self._approval_store.resolve_pending(approval_id, decision)
 
     # ------------------------------------------------------------------
     # Session grants
@@ -185,23 +178,19 @@ class PermissionGate:
         """Add a temporary session grant for a tool.
 
         Args:
-            ctx: context dict (reserved for future per-session scoping)
+            ctx: context dict (must contain chat_id and agent_id)
             tool_name: the tool to grant
-            ttl: grant duration in seconds (default 10 minutes)
+            ttl: grant duration in seconds (default 10 minutes, 0 = no expiry)
         """
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
-        self._session_grants.append(
-            _SessionGrant(tool_name=tool_name, expires_at=expires_at)
-        )
+        chat_id = ctx.get("chat_id", "")
+        agent_id = ctx.get("agent_id", "")
+        expires_at = int(datetime.now(timezone.utc).timestamp()) + ttl if ttl > 0 else None
+        self._approval_store.grant_session(chat_id, agent_id, tool_name, expires_at)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _has_session_grant(self, tool_name: str) -> bool:
+    def _has_session_grant(self, chat_id: str, agent_id: str, tool_name: str) -> bool:
         """Check if an active (non-expired) session grant exists for *tool_name*."""
-        now = datetime.now(timezone.utc)
-        self._session_grants = [
-            g for g in self._session_grants if g.expires_at > now
-        ]
-        return any(g.tool_name == tool_name for g in self._session_grants)
+        return self._approval_store.has_session_grant(chat_id, agent_id, tool_name)

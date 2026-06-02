@@ -17,3 +17,5 @@ class AgentContext:
     channel: Any = None
     timeout: int = 30
     sandbox_mode: str = "safe"
+    audit_logger: Any = None  # SecurityAuditLogger instance
+    chain_detector: Any = None  # ChainDetector instance

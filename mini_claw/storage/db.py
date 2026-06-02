@@ -58,6 +58,74 @@ class Database:
             # Column already exists, safe to ignore
             pass
 
+        # Migration 2: Upgrade processed_events table with heartbeat and status fields
+        try:
+            # Check if old schema exists
+            cursor = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='processed_events'"
+            )
+            row = cursor.fetchone()
+            if row and "status" not in row[0]:
+                # Old schema detected, migrate to new schema
+                self._conn.executescript("""
+                    -- Rename old table
+                    ALTER TABLE processed_events RENAME TO processed_events_old;
+
+                    -- Create new table with full schema
+                    CREATE TABLE processed_events (
+                        event_id TEXT PRIMARY KEY,
+                        chat_id TEXT,
+                        status TEXT NOT NULL,
+                        run_id TEXT,
+                        started_at INTEGER NOT NULL,
+                        heartbeat_at INTEGER NOT NULL,
+                        finished_at INTEGER,
+                        error TEXT,
+                        attempt_count INTEGER DEFAULT 1
+                    );
+
+                    CREATE INDEX idx_processed_events_started_at ON processed_events(started_at);
+                    CREATE INDEX idx_processed_events_status ON processed_events(status);
+                    CREATE INDEX idx_processed_events_heartbeat ON processed_events(heartbeat_at);
+
+                    -- Migrate old data
+                    INSERT INTO processed_events (event_id, chat_id, status, started_at, heartbeat_at, finished_at)
+                    SELECT event_id, NULL, 'handled', processed_at, processed_at, processed_at
+                    FROM processed_events_old;
+
+                    -- Drop old table
+                    DROP TABLE processed_events_old;
+                """)
+                self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration 3: Add bypass TTL fields to sessions
+        migrations = [
+            "ALTER TABLE sessions ADD COLUMN sandbox_mode_expires_at INTEGER",
+            "ALTER TABLE sessions ADD COLUMN sandbox_mode_persistent INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN sandbox_mode_single_use INTEGER DEFAULT 0",
+        ]
+        for migration in migrations:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+        # Migration 4: Add compaction fields to messages
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN is_compaction_summary INTEGER DEFAULT 0")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
@@ -166,9 +234,58 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id, id);
 
+-- Event deduplication with crash recovery support
 CREATE TABLE IF NOT EXISTS processed_events (
-    event_id     TEXT PRIMARY KEY,
-    processed_at INTEGER
+    event_id TEXT PRIMARY KEY,
+    chat_id TEXT,
+    status TEXT NOT NULL,        -- "processing" / "handled" / "failed"
+    run_id TEXT,
+    started_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL,  -- Heartbeat timestamp for long-running tasks
+    finished_at INTEGER,
+    error TEXT,
+    attempt_count INTEGER DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_events_started_at ON processed_events(started_at);
+CREATE INDEX IF NOT EXISTS idx_processed_events_status ON processed_events(status);
+CREATE INDEX IF NOT EXISTS idx_processed_events_heartbeat ON processed_events(heartbeat_at);
+
+-- Security audit log
+CREATE TABLE IF NOT EXISTS security_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    debug_id TEXT UNIQUE NOT NULL,
+    event_type TEXT NOT NULL,
+    details TEXT,
+    chat_id TEXT,
+    agent_id TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_security_audit_debug_id ON security_audit(debug_id);
+CREATE INDEX IF NOT EXISTS idx_security_audit_created_at ON security_audit(created_at);
+
+-- Pending confirmations (for persistent bypass, etc.)
+CREATE TABLE IF NOT EXISTS pending_confirmations (
+    chat_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    type TEXT NOT NULL,        -- "bypass_persistent" / future types
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, agent_id, type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_confirmations_expires_at ON pending_confirmations(expires_at);
+
+-- Task state for context preservation
+CREATE TABLE IF NOT EXISTS task_state (
+    chat_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    goal TEXT,
+    test_command TEXT,
+    facts_json TEXT,        -- JSON serialized facts list
+    updated_at INTEGER,
+    PRIMARY KEY (chat_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS scheduled_tasks (

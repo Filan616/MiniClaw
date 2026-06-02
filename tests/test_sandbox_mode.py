@@ -131,8 +131,14 @@ def test_bypass_mode_lists_outside_dir(workspace, tmp_path):
 
 
 @pytest.fixture
-def gate() -> PermissionGate:
-    return PermissionGate(PermissionPolicy(PermissionsConfig()))
+def gate(tmp_path: Path) -> PermissionGate:
+    from mini_claw.permissions.approval_store import ApprovalStore
+    from mini_claw.storage.db import Database
+
+    db = Database(tmp_path / "gate_test.db")
+    db.init_tables()
+    approval_store = ApprovalStore(db)
+    return PermissionGate(PermissionPolicy(PermissionsConfig()), approval_store)
 
 
 def test_gate_safe_mode_blocks_sensitive(gate):

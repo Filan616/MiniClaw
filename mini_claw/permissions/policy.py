@@ -31,6 +31,16 @@ class PermissionPolicy:
         """
         return any(p.search(cmd) for p in self._blacklist_patterns)
 
+    def first_blacklist_match(self, cmd: str) -> str | None:
+        """Return the first blacklist pattern that matches *cmd*, or None.
+
+        Used for audit logging to record which specific pattern was triggered.
+        """
+        for p in self._blacklist_patterns:
+            if p.search(cmd):
+                return p.pattern
+        return None
+
     def is_sensitive_path(self, path: str) -> bool:
         """Return True if *path* points at a known-sensitive credential file.
 

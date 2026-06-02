@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,30 @@ from fastapi import FastAPI
 from mini_claw.config import AppConfig, get_data_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _recover_stale_events(storage: Any) -> None:
+    """Recover stale processing events on service startup.
+
+    Events stuck in 'processing' with heartbeat older than 5 minutes are
+    marked as 'failed'. This only runs once at startup, not during normal
+    handle_message flow to avoid preempting long-running tasks.
+    """
+    stale_threshold = int(time.time()) - 300  # 5 minutes
+    stale = storage.fetchall(
+        "SELECT event_id FROM processed_events "
+        "WHERE status='processing' AND heartbeat_at < ?",
+        (stale_threshold,),
+    )
+    for row in stale:
+        storage.execute(
+            "UPDATE processed_events "
+            "SET status='failed', finished_at=?, error='service restarted, marked as failed' "
+            "WHERE event_id=?",
+            (int(time.time()), row["event_id"]),
+        )
+    if stale:
+        logger.info(f"Recovered {len(stale)} stale processing events on startup")
 
 
 def create_components(
@@ -24,6 +49,7 @@ def create_components(
     """
     from mini_claw.agent.workspace import WorkspaceManager
     from mini_claw.gateway.router import Gateway
+    from mini_claw.permissions.approval_store import ApprovalStore
     from mini_claw.permissions.gate import PermissionGate
     from mini_claw.permissions.policy import PermissionPolicy
     from mini_claw.providers import get_provider
@@ -52,9 +78,15 @@ def create_components(
     skills = load_skills(skills_dir)
     register_skill_tools(registry, skills)
 
-    # Permissions
+    # Permissions (Phase 0.2: ApprovalStore for persistent approvals/grants)
+    approval_store = ApprovalStore(storage)
     policy = PermissionPolicy(config.permissions)
-    permission_gate = PermissionGate(policy, storage)
+    permission_gate = PermissionGate(policy, approval_store)
+
+    # Expire old pending approvals on startup
+    expired = approval_store.expire_pending(86400)
+    if expired:
+        logger.info(f"Expired {expired} old pending approvals on startup")
 
     # Workspaces — one filesystem dir per agent, co-located with the db
     workspace_manager = WorkspaceManager(base_dir=data_dir / "workspaces")
@@ -114,6 +146,9 @@ def create_app(config: AppConfig, config_path: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # Startup: recover stale processing events from crashes
+        _recover_stale_events(components["storage"])
+
         if feishu is not None:
             await feishu.start()
         try:

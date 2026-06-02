@@ -131,3 +131,62 @@ async def test_agent_loop_duplicate_detection(
         agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
     )
     assert result.status == RunOutcome.DONE
+
+
+@pytest.mark.asyncio
+async def test_parallel_precheck_splits_by_evaluate_not_metadata(
+    agent_run, mock_provider, mock_registry, mock_result_processor, ctx
+):
+    """Phase 0.7: parallel/sequential split must call evaluate upfront.
+
+    Two L0 calls are issued: list_directory(".") and list_directory(".ssh").
+    Both are L0 metadata, but the .ssh one is denied by evaluate (sensitive
+    path). Only the first should go parallel; the second must be rejected in
+    the sequential path with proper obfuscation.
+    """
+    from pathlib import Path
+
+    # Two L0 calls
+    call_ok = ToolCall(id="call_1", name="list_directory", arguments={"path": "."})
+    call_ssh = ToolCall(id="call_2", name="list_directory", arguments={"path": ".ssh"})
+
+    responses = [
+        LLMResponse(text="", tool_calls=[call_ok, call_ssh], finish_reason="tool_calls", raw={}),
+        LLMResponse(text="Listed", tool_calls=[], finish_reason="stop", raw={}),
+    ]
+    mock_provider.chat.side_effect = responses
+
+    tool_list_dir = MagicMock()
+    tool_list_dir.name = "list_directory"
+    tool_list_dir.permission_level = "L0"
+    tool_list_dir.handler = AsyncMock(return_value="file1\nfile2")
+    mock_registry.get.return_value = tool_list_dir
+
+    # Mock gate: allow for ".", deny for ".ssh"
+    def evaluate_side_effect(**kwargs):
+        args = kwargs.get("args", {})
+        if args.get("path") == ".ssh":
+            return Decision(action="deny", reason="Access denied", internal_reason="sensitive")
+        return Decision(action="allow")
+
+    mock_gate = MagicMock()
+    mock_gate.evaluate.side_effect = evaluate_side_effect
+
+    # Workspace with .ssh dir
+    ctx.workspace_dir = Path(".")
+    ctx.sandbox_mode = "safe"
+
+    result = await run_agent_step(
+        agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
+    )
+    assert result.status == RunOutcome.DONE
+
+    # Check messages: call_1 (.) should succeed, call_2 (.ssh) should be denied
+    tool_results = [m for m in result.messages if m.get("role") == "tool"]
+    assert len(tool_results) == 2
+
+    ok_result = next(m for m in tool_results if m["tool_call_id"] == "call_1")
+    assert "file1" in ok_result["content"] or "[denied]" not in ok_result["content"]
+
+    ssh_result = next(m for m in tool_results if m["tool_call_id"] == "call_2")
+    assert "[denied]" in ssh_result["content"]

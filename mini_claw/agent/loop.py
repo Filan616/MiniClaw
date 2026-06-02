@@ -40,6 +40,8 @@ class AgentRun:
     pending_tool_call: Optional[str] = None
     final_answer: Optional[str] = None
     allowed_tools: list[str] = field(default_factory=list)
+    dangerous_actions: dict[str, Any] = field(default_factory=dict)
+    written_scripts: dict[str, str] = field(default_factory=dict)
 
 
 def _call_signature(call_name: str, call_args: dict[str, Any]) -> str:
@@ -56,6 +58,8 @@ def _build_tool_context(ctx: AgentContext) -> ToolContext:
         agent_id=ctx.agent_id,
         timeout=ctx.timeout,
         sandbox_mode=ctx.sandbox_mode,
+        audit_logger=ctx.audit_logger,
+        chain_detector=getattr(ctx, "chain_detector", None),
     )
 
 
@@ -104,11 +108,26 @@ async def _process_single_tool_call(
         tool=tc.name, args=tc.arguments, ctx=_ctx_to_dict(ctx)
     )
 
+    # Handle audit event if present
+    if decision.audit_event:
+        debug_id = ctx.audit_logger.log_security_event(
+            event_type=decision.audit_event["event_type"],
+            details=decision.audit_event,
+            chat_id=ctx.chat_id,
+            agent_id=ctx.agent_id,
+        )
+        decision = decision.__class__(
+            action=decision.action,
+            reason=decision.reason.replace("{debug_id}", debug_id),
+            internal_reason=decision.internal_reason,
+            audit_event=decision.audit_event,
+        )
+
     if decision.action == "deny":
         return {
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": "[denied] permission denied for this action",
+            "content": f"[denied] {decision.reason}",
         }
 
     if decision.action == "need_approval":
@@ -120,6 +139,24 @@ async def _process_single_tool_call(
         }
 
     # decision.action == "allow"
+    # Chain attack detection (pre-tool)
+    if hasattr(ctx, "chain_detector") and ctx.chain_detector:
+        blocked = ctx.chain_detector.evaluate_before_tool(tc, run, ctx)
+        if blocked:
+            debug_id = ""
+            if ctx.audit_logger:
+                debug_id = ctx.audit_logger.log_security_event(
+                    event_type="chain_attack_blocked",
+                    details=blocked,
+                    chat_id=ctx.chat_id,
+                    agent_id=ctx.agent_id,
+                )
+            return {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": f"[denied] Chain attack detected. debug_id={debug_id}",
+            }
+
     try:
         result = await tool.handler(**tc.arguments, ctx=tool_ctx)
     except TypeError as exc:
@@ -133,6 +170,10 @@ async def _process_single_tool_call(
         if result_processor:
             result = result_processor.process(result, tc.name)
 
+    # Chain attack detection (post-tool observation)
+    if hasattr(ctx, "chain_detector") and ctx.chain_detector:
+        ctx.chain_detector.observe_after_tool(tc, run, result, success=True)
+
     return {
         "role": "tool",
         "tool_call_id": tc.id,
@@ -141,7 +182,7 @@ async def _process_single_tool_call(
 
 
 async def _process_tool_calls_parallel(
-    calls: list[tuple[int, Any]],
+    calls: list[tuple[int, Any, Any]],  # (index, tool_call, pre-evaluated decision)
     run: AgentRun,
     registry: ToolRegistry,
     permission_gate: Any,
@@ -149,15 +190,37 @@ async def _process_tool_calls_parallel(
     tool_ctx: ToolContext,
     ctx: AgentContext,
 ) -> list[tuple[int, Any, dict[str, Any]]]:
-    """Process multiple tool calls in parallel and return results."""
-    tasks = [
-        _process_single_tool_call(tc, run, registry, permission_gate, result_processor, tool_ctx, ctx)
-        for idx, tc in calls
-    ]
+    """Process multiple tool calls in parallel and return results.
+
+    Phase 0.7: ``calls`` now carries pre-evaluated decisions from the
+    permission gate. The parallel batch should only receive ``allow``
+    decisions, but we defensively check and downgrade any stragglers.
+    """
+
+    async def _safe_process(tc, decision):
+        """Wrapper that short-circuits non-allow decisions."""
+        if decision.action != "allow":
+            if ctx.audit_logger:
+                ctx.audit_logger.log_security_event(
+                    event_type="parallel_precheck_violation",
+                    details={"tool": tc.name, "args": tc.arguments, "action": decision.action},
+                    chat_id=ctx.chat_id,
+                    agent_id=ctx.agent_id,
+                )
+            return {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": "[ERROR] Internal: non-allow in parallel batch",
+            }
+        # Already evaluated; mark decision on tc so _process_single_tool_call can skip re-eval.
+        tc._precheck_decision = decision
+        return await _process_single_tool_call(tc, run, registry, permission_gate, result_processor, tool_ctx, ctx)
+
+    tasks = [_safe_process(tc, decision) for idx, tc, decision in calls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     output = []
-    for (idx, tc), result in zip(calls, results):
+    for (idx, tc, decision), result in zip(calls, results):
         if isinstance(result, Exception):
             result_msg = {
                 "role": "tool",
@@ -234,17 +297,33 @@ async def run_agent_step(
         }
         run.messages.append(assistant_msg)
 
-        # Group tool calls: parallel-safe (L0) vs sequential
-        parallel_calls: list[tuple[int, Any]] = []  # (index, tool_call)
-        sequential_calls: list[tuple[int, Any]] = []
+        # Group tool calls: parallel-safe (L0 + allow) vs sequential.
+        # Phase 0.7: Pre-check permissions for every call BEFORE splitting
+        # into batches. An L0 tool whose args point to a sensitive path
+        # (e.g. list_directory(".ssh")) will be denied by evaluate even
+        # though the tool metadata says L0; those go to the sequential path
+        # for proper error obfuscation and audit.
+        parallel_calls: list[tuple[int, Any, Any]] = []  # (index, tc, decision)
+        sequential_calls: list[tuple[int, Any, Any]] = []  # (index, tc, decision)
 
         for idx, tc in enumerate(response.tool_calls):
             tool = registry.get(tc.name)
-            # L0 tools are read-only and safe to parallelize
-            if tool and tool.permission_level == "L0":
-                parallel_calls.append((idx, tc))
+            if tool is None:
+                # Unknown tool -> sequential (will error there)
+                sequential_calls.append((idx, tc, None))
+                continue
+
+            # Pre-evaluate every call to classify by actual permission outcome.
+            decision = permission_gate.evaluate(
+                tool=tc.name, args=tc.arguments, ctx=_ctx_to_dict(ctx)
+            )
+
+            # Only calls that are BOTH allowed AND L0-rated go parallel.
+            if decision.action == "allow" and tool.permission_level == "L0":
+                parallel_calls.append((idx, tc, decision))
             else:
-                sequential_calls.append((idx, tc))
+                # deny / need_approval / non-L0 → sequential
+                sequential_calls.append((idx, tc, decision))
 
         # Process parallel calls first
         if parallel_calls:
@@ -255,7 +334,7 @@ async def run_agent_step(
                 run.messages.append(result_msg)
 
         # Process sequential calls
-        for idx, tc in sequential_calls:
+        for idx, tc, precheck_decision in sequential_calls:
             sig = _call_signature(tc.name, tc.arguments)
 
             # Duplicate detection
@@ -268,7 +347,7 @@ async def run_agent_step(
                 continue
             run.seen_calls.add(sig)
 
-            # Permission check
+            # Permission check (Phase 0.7: reuse precheck if available)
             tool = registry.get(tc.name)
             if tool is None:
                 run.messages.append({
@@ -278,15 +357,36 @@ async def run_agent_step(
                 })
                 continue
 
-            decision = permission_gate.evaluate(
-                tool=tc.name, args=tc.arguments, ctx=_ctx_to_dict(ctx)
-            )
+            # If we have a precheck decision from the split phase, use it;
+            # otherwise evaluate now (this path only triggers if the split
+            # logic put a None-decision call here, e.g. unknown tool).
+            if precheck_decision is not None:
+                decision = precheck_decision
+            else:
+                decision = permission_gate.evaluate(
+                    tool=tc.name, args=tc.arguments, ctx=_ctx_to_dict(ctx)
+                )
+
+            # Handle audit event if present
+            if decision.audit_event:
+                debug_id = ctx.audit_logger.log_security_event(
+                    event_type=decision.audit_event["event_type"],
+                    details=decision.audit_event,
+                    chat_id=ctx.chat_id,
+                    agent_id=ctx.agent_id,
+                )
+                decision = decision.__class__(
+                    action=decision.action,
+                    reason=decision.reason.replace("{debug_id}", debug_id),
+                    internal_reason=decision.internal_reason,
+                    audit_event=decision.audit_event,
+                )
 
             if decision.action == "deny":
                 run.messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": "[denied] permission denied for this action",
+                    "content": f"[denied] {decision.reason}",
                 })
                 continue
 
@@ -302,6 +402,25 @@ async def run_agent_step(
                 return run
 
             # decision.action == "allow"
+            # Chain attack detection (pre-tool)
+            if hasattr(ctx, "chain_detector") and ctx.chain_detector:
+                blocked = ctx.chain_detector.evaluate_before_tool(tc, run, ctx)
+                if blocked:
+                    debug_id = ""
+                    if ctx.audit_logger:
+                        debug_id = ctx.audit_logger.log_security_event(
+                            event_type="chain_attack_blocked",
+                            details=blocked,
+                            chat_id=ctx.chat_id,
+                            agent_id=ctx.agent_id,
+                        )
+                    run.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": f"[denied] Chain attack detected. debug_id={debug_id}",
+                    })
+                    continue
+
             try:
                 result = await tool.handler(**tc.arguments, ctx=tool_ctx)
             except TypeError as exc:
@@ -314,6 +433,11 @@ async def run_agent_step(
             else:
                 if result_processor:
                     result = result_processor.process(result, tc.name)
+
+            # Chain attack detection (post-tool observation)
+            if hasattr(ctx, "chain_detector") and ctx.chain_detector:
+                ctx.chain_detector.observe_after_tool(tc, run, result, success=True)
+
             run.messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,

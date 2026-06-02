@@ -29,32 +29,75 @@ class OpenAIProvider(Provider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
+        stream_callback: Any = None,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "stream": stream,
         }
         if tools:
             kwargs["tools"] = self.format_tools(tools)
 
-        resp = await self.client.chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        msg = choice.message
+        if stream and stream_callback:
+            # Streaming path
+            resp = await self.client.chat.completions.create(**kwargs)
+            collected_text = ""
+            tool_calls: list[ToolCall] = []
+            finish_reason = None
 
-        tool_calls: list[ToolCall] = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_calls.append(
-                    ToolCall(
-                        id=tc.id,
-                        name=tc.function.name,
-                        arguments=json.loads(tc.function.arguments),
+            async for chunk in resp:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                if delta.content:
+                    collected_text += delta.content
+                    stream_callback(delta.content)
+
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                # Tool calls in streaming (accumulate)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        # Simplified: assume tool_calls come complete in one chunk
+                        if tc_delta.function and tc_delta.function.name:
+                            tool_calls.append(
+                                ToolCall(
+                                    id=tc_delta.id or "",
+                                    name=tc_delta.function.name,
+                                    arguments=json.loads(tc_delta.function.arguments or "{}"),
+                                )
+                            )
+
+            return LLMResponse(
+                text=collected_text or None,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                raw={},
+            )
+        else:
+            # Non-streaming path
+            resp = await self.client.chat.completions.create(**kwargs)
+            choice = resp.choices[0]
+            msg = choice.message
+
+            tool_calls: list[ToolCall] = []
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_calls.append(
+                        ToolCall(
+                            id=tc.id,
+                            name=tc.function.name,
+                            arguments=json.loads(tc.function.arguments),
+                        )
                     )
-                )
 
-        return LLMResponse(
-            text=msg.content,
-            tool_calls=tool_calls,
-            finish_reason=choice.finish_reason,
-            raw=resp.model_dump(),
-        )
+            return LLMResponse(
+                text=msg.content,
+                tool_calls=tool_calls,
+                finish_reason=choice.finish_reason,
+                raw=resp.model_dump(),
+            )

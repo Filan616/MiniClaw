@@ -18,7 +18,7 @@ pip install -e .
 mini-claw setup
 ```
 
-这会在 `~/.mini-claw/config.toml` 创建默认配置文件，编辑它填入你的 API Key。
+这会在**当前目录**生成 `config.yaml`，编辑它填入你的 API Key。后续命令默认从当前目录读取这份配置；也可以用 `--config /path/to/config.yaml` 指定其它路径。
 
 ### 3. 自检
 
@@ -37,6 +37,8 @@ mini-claw chat
 ```bash
 mini-claw run
 ```
+
+> 飞书使用**长连接（WebSocket）模式**：服务启动时由 SDK 主动连接飞书服务器，不需要公网域名、Webhook URL 或加密 Key。在 `config.yaml` 里把 `channels_feishu.enabled` 设成 `true` 并填入 `app_id` / `app_secret` 即可。
 
 ## 架构概览
 
@@ -64,17 +66,19 @@ mini-claw run
 
 ## 配置
 
-复制 `config.example.toml` 到 `~/.mini-claw/config.toml`：
+复制 `config.example.yaml` 到当前目录的 `config.yaml`：
 
 ```bash
-cp config.example.toml ~/.mini-claw/config.toml
+cp config.example.yaml config.yaml
 ```
 
 主要配置项：
-- `[provider]` — LLM 提供商（deepseek/openai/ollama）
-- `[channels.feishu]` — 飞书应用凭证
-- `[permissions]` — 权限分级策略
-- `[[agents]]` — 多 agent 配置与路由
+- `provider` — LLM 提供商（deepseek/openai/ollama）
+- `channels_feishu` — 飞书应用凭证
+- `permissions` — 权限分级策略
+- `agents` — 多 agent 配置与路由
+
+数据库（`mini_claw.db`）会与 `config.yaml` 同目录创建。
 
 ## 权限模型
 

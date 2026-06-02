@@ -66,35 +66,51 @@ class PermissionGate:
         """
         level = ctx.get("level", self._policy.config.default_level)
         cmd = args.get("command", args.get("cmd", ""))
+        sandbox_mode = ctx.get("sandbox_mode", "safe")
 
-        # 1. Blacklist check (any level)
+        # 1. Blacklist check (always-on safety net, even in bypass mode).
         if cmd and self._policy.is_blacklisted(cmd):
             return Decision(action="deny", reason=f"command matches blacklist: {cmd!r}")
 
-        # 2. Path escape check
-        path = args.get("path", args.get("file", ""))
-        workspace_dir = ctx.get("workspace_dir")
-        if path and workspace_dir:
-            from pathlib import Path as _Path
-            if not self._policy.path_in_workspace(path, _Path(workspace_dir)):
-                return Decision(
-                    action="deny",
-                    reason=f"path escapes workspace: {path!r}",
-                )
+        # In bypass mode, skip the sensitive-file and workspace-escape checks.
+        # The user has explicitly opted to give the agent full filesystem access.
+        if sandbox_mode != "bypass":
+            # 2. Sensitive-file check (any level, before workspace check so the
+            # error reason is more specific than "path escapes workspace").
+            candidate_paths = [p for p in (args.get("path"), args.get("file")) if p]
+            for cp in candidate_paths:
+                if self._policy.is_sensitive_path(cp):
+                    if self._policy.is_sensitive_path_allowlisted(cp):
+                        continue
+                    return Decision(
+                        action="deny",
+                        reason=f"path matches sensitive-file pattern: {cp!r}",
+                    )
 
-        # 3. L4 deny-by-default (unless template match)
+            # 3. Path escape check
+            path = args.get("path", args.get("file", ""))
+            workspace_dir = ctx.get("workspace_dir")
+            if path and workspace_dir:
+                from pathlib import Path as _Path
+                if not self._policy.path_in_workspace(path, _Path(workspace_dir)):
+                    return Decision(
+                        action="deny",
+                        reason=f"path escapes workspace: {path!r}",
+                    )
+
+        # 4. L4 deny-by-default (unless template match)
         if level in self._policy.config.deny_by_default:
             if self._policy.matches_high_risk_template(tool, args):
                 return Decision(action="allow", reason="matches allowed high-risk template")
             return Decision(action="deny", reason=f"level {level} is denied by default")
 
-        # 4. L3 require confirmation (unless session grant)
+        # 5. L3 require confirmation (unless session grant)
         if level in self._policy.config.require_confirm:
             if self._has_session_grant(tool):
                 return Decision(action="allow", reason="session grant active")
             return Decision(action="need_approval", reason=f"level {level} requires confirmation")
 
-        # 5. Default allow
+        # 6. Default allow
         return Decision(action="allow", reason="permitted by policy")
 
     # ------------------------------------------------------------------

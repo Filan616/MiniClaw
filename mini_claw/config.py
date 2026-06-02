@@ -1,17 +1,36 @@
-"""Pydantic-based configuration for Mini-Claw."""
+"""Pydantic-based configuration for Mini-Claw.
+
+Configuration is stored as ``config.yaml`` in the current working directory.
+Run ``mini-claw setup`` in your project directory to generate it.
+"""
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 from typing import Optional
 
+import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 
-DEFAULT_CONFIG_DIR = Path.home() / ".mini-claw"
-DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
+CONFIG_FILENAME = "config.yaml"
+
+
+def get_config_path(path: Path | None = None) -> Path:
+    """Resolve the config path. Defaults to ``./config.yaml`` in the cwd."""
+    if path is not None:
+        return path
+    return Path.cwd() / CONFIG_FILENAME
+
+
+def get_data_dir(config_path: Path | None = None) -> Path:
+    """Directory used for runtime data (sqlite db, etc).
+
+    Co-located with the config file so the project directory stays
+    self-contained.
+    """
+    return get_config_path(config_path).parent
 
 
 class ProviderConfig(BaseModel):
@@ -22,11 +41,17 @@ class ProviderConfig(BaseModel):
 
 
 class FeishuChannelConfig(BaseModel):
+    """Feishu (Lark) channel — long-connection mode.
+
+    Long-connection (WebSocket) only requires ``app_id`` / ``app_secret``;
+    the SDK opens an outbound connection to Feishu and events are pushed
+    over it, so no Webhook URL, ``verification_token``, or ``encrypt_key``
+    is needed.
+    """
+
     enabled: bool = False
     app_id: str = ""
     app_secret: str = ""
-    verification_token: str = ""
-    encrypt_key: str = ""
 
 
 class ServerConfig(BaseModel):
@@ -40,12 +65,73 @@ class PermissionsHighRiskConfig(BaseModel):
     allowed_command_templates: list[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Shell blacklist defaults
+# ---------------------------------------------------------------------------
+# Patterns matched via ``re.search`` (substring-anywhere) on the command
+# string. Keep word-bounded (``\b``) and flag-anchored where possible to
+# avoid firing on safe commands like ``echo 'hello'``, ``ls -la``, or
+# ``pytest -k 'rm or curl'``. Mirror updates here in any project-level
+# ``config.yaml`` overrides.
+
+_DEFAULT_SHELL_BLACKLIST: tuple[str, ...] = (
+    # --- shell-internal destruction ---
+    r"\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+/(?:\s|$)",
+    r"\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+~(?:/|\s|$)",
+    r"\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+\$HOME\b",
+    r"\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+/\*",
+    r"\bmkfs(?:\.|\s)",
+    r"\bdd\s+if=",
+    r":\(\)\s*\{",
+    r"\bshred\s+-",
+    r"\bswapoff\s+-a\b",
+    # --- destructive find ---
+    r"\bfind\b[^|;&]*\s-delete\b",
+    r"\bfind\b[^|;&]*-exec\s+rm\b",
+    # --- network -> shell pipes ---
+    r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b",
+    r"\bwget\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b",
+    r"\bfetch\b[^|]*\|\s*(?:ba)?sh\b",
+    # --- inline interpreters (-c / -e / -r) ---
+    r"\bbash\s+-c\b",
+    r"\bsh\s+-c\b",
+    r"\bzsh\s+-c\b",
+    r"\bpython3?\s+-c\b",
+    r"\bnode\s+-e\b",
+    r"\bperl\s+-e\b",
+    r"\bruby\s+-e\b",
+    r"\bphp\s+-r\b",
+    # --- encoding / decoding bypass ---
+    r"\bbase64\s+(?:-d|--decode)\b[^|]*\|\s*(?:ba)?sh\b",
+    r"\bxxd\s+-r\b[^|]*\|\s*(?:ba)?sh\b",
+    r"\bopenssl\s+enc\s+-d\b[^|]*\|\s*(?:ba)?sh\b",
+    # --- eval / command substitution feeding shell ---
+    r"\beval\s+[\"']?\$\(\s*curl\b",
+    r"\beval\s+[\"']?\$\(\s*wget\b",
+    r"`\s*curl\b",
+    r"`\s*wget\b",
+    # --- credential / system file overwrite (Linux) ---
+    r">\s*~/\.ssh/",
+    r">\s*\$HOME/\.ssh/",
+    r">\s*/etc/passwd\b",
+    r">\s*/etc/shadow\b",
+    r">\s*/etc/sudoers\b",
+    # --- Windows PowerShell vectors ---
+    r"(?i)\bpowershell(?:\.exe)?\s+(?:-|/)e(?:nc(?:odedcommand)?)?\b",
+    r"(?i)\bpowershell(?:\.exe)?\s+(?:-|/)c(?:ommand)?\b",
+    r"(?i)\b(?:iex|Invoke-Expression)\b",
+    r"(?i)\bDownloadString\s*\(",
+    r"(?i)\biwr\b[^|]*\|\s*iex\b",
+)
+
+
 class PermissionsConfig(BaseModel):
     default_level: str = "L2"
+    sandbox_mode: str = "safe"  # "safe" = path sandbox + sensitive check; "bypass" = no restrictions
     require_confirm: list[str] = Field(default_factory=lambda: ["L3"])
     deny_by_default: list[str] = Field(default_factory=lambda: ["L4"])
     shell_blacklist: list[str] = Field(
-        default_factory=lambda: [r"rm\s+-rf\s+/", r"mkfs", r":\(\)\{"]
+        default_factory=lambda: list(_DEFAULT_SHELL_BLACKLIST)
     )
     high_risk: PermissionsHighRiskConfig = Field(
         default_factory=PermissionsHighRiskConfig
@@ -70,17 +156,12 @@ class AppConfig(BaseModel):
 
 
 def load_config(path: Path | None = None) -> AppConfig:
-    config_path = path or DEFAULT_CONFIG_PATH
+    config_path = get_config_path(path)
     if config_path.exists():
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
-        if "channels" in data and "feishu" in data["channels"]:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if "channels" in data and isinstance(data["channels"], dict) and "feishu" in data["channels"]:
             data["channels_feishu"] = data["channels"]["feishu"]
             del data["channels"]
         return AppConfig(**data)
     return AppConfig()
-
-
-def ensure_config_dir() -> Path:
-    DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_CONFIG_DIR

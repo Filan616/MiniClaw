@@ -170,6 +170,6 @@ class SchedulerManager:
             timestamp=int(time.time()),
         )
 
-        # Route through gateway (channel will be resolved by the gateway)
+        # Route through gateway (channel is set on the gateway during startup)
         logger.info("Executing scheduled task %s", task_id)
-        await self._gateway.handle_message(synthetic_msg, channel=None)
+        await self._gateway.handle_message(synthetic_msg)

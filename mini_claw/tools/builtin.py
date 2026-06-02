@@ -6,7 +6,20 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from ..utils.paths import assert_not_sensitive, ensure_inside
 from .registry import Tool, ToolContext
+
+
+def _bypass_resolve(path: str, workspace: Path) -> Path:
+    """In bypass mode: relative paths join to workspace, absolute paths pass through.
+
+    This gives the agent a default working directory (the workspace) for convenience,
+    while still allowing it to specify absolute system paths when needed.
+    """
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (workspace / p).resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +74,14 @@ TOOL_RUN_SHELL = Tool(
 
 async def _read_file(path: str, *, ctx: ToolContext) -> str:
     """Read a file and return its content as a string."""
-    file_path = _resolve_path(path, ctx.workspace_dir)
+    try:
+        if ctx.sandbox_mode == "bypass":
+            file_path = _bypass_resolve(path, ctx.workspace_dir)
+        else:
+            file_path = ensure_inside(path, ctx.workspace_dir)
+            assert_not_sensitive(file_path.relative_to(ctx.workspace_dir.resolve()))
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
     if not file_path.is_file():
         return f"[ERROR] File not found: {file_path}"
     try:
@@ -91,7 +111,14 @@ TOOL_READ_FILE = Tool(
 
 async def _write_file(path: str, content: str, *, ctx: ToolContext) -> str:
     """Write content to a file, creating parent directories as needed."""
-    file_path = _resolve_path(path, ctx.workspace_dir)
+    try:
+        if ctx.sandbox_mode == "bypass":
+            file_path = _bypass_resolve(path, ctx.workspace_dir)
+        else:
+            file_path = ensure_inside(path, ctx.workspace_dir)
+            assert_not_sensitive(file_path.relative_to(ctx.workspace_dir.resolve()))
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
@@ -122,7 +149,13 @@ TOOL_WRITE_FILE = Tool(
 
 async def _list_directory(path: str = ".", *, ctx: ToolContext) -> str:
     """List contents of a directory."""
-    dir_path = _resolve_path(path, ctx.workspace_dir)
+    try:
+        if ctx.sandbox_mode == "bypass":
+            dir_path = _bypass_resolve(path, ctx.workspace_dir)
+        else:
+            dir_path = ensure_inside(path, ctx.workspace_dir)
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
     if not dir_path.is_dir():
         return f"[ERROR] Not a directory: {dir_path}"
     try:
@@ -151,18 +184,9 @@ TOOL_LIST_DIRECTORY = Tool(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# All built-in tools for easy import
 # ---------------------------------------------------------------------------
 
-def _resolve_path(path: str, workspace: Path) -> Path:
-    """Resolve a path relative to workspace, or use as absolute."""
-    p = Path(path)
-    if p.is_absolute():
-        return p
-    return (workspace / p).resolve()
-
-
-# All built-in tools for easy import
 BUILTIN_TOOLS: list[Tool] = [
     TOOL_RUN_SHELL,
     TOOL_READ_FILE,

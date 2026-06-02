@@ -16,3 +16,4 @@ class AgentContext:
     workspace_dir: Path
     channel: Any = None
     timeout: int = 30
+    sandbox_mode: str = "safe"

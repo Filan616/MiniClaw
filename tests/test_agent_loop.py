@@ -110,8 +110,9 @@ async def test_agent_loop_duplicate_detection(
     agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
 ):
     call = ToolCall(id="call_1", name="run_shell", arguments={"cmd": "ls"})
+    # Match the loop's _call_signature scheme: md5(json.dumps({name, args}, sort_keys=True))
     sig = hashlib.md5(
-        f"{call.name}:{json.dumps(call.arguments, sort_keys=True)}".encode()
+        json.dumps({"name": call.name, "args": call.arguments}, sort_keys=True).encode()
     ).hexdigest()
     agent_run.seen_calls.add(sig)
 

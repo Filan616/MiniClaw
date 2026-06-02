@@ -12,10 +12,9 @@ from rich.console import Console
 from rich.table import Table
 
 from mini_claw.config import (
-    DEFAULT_CONFIG_DIR,
-    DEFAULT_CONFIG_PATH,
     AppConfig,
-    ensure_config_dir,
+    get_config_path,
+    get_data_dir,
     load_config,
 )
 
@@ -34,6 +33,10 @@ app.add_typer(runs_app, name="runs")
 
 console = Console()
 
+
+def _db_path(config_path: Optional[Path]) -> Path:
+    return get_data_dir(config_path) / "mini_claw.db"
+
 # ---------------------------------------------------------------------------
 # mini-claw run
 # ---------------------------------------------------------------------------
@@ -46,11 +49,20 @@ def run(
     ),
     host: Optional[str] = typer.Option(None, "--host", help="监听地址"),
     port: Optional[int] = typer.Option(None, "--port", "-p", help="监听端口"),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="开启 DEBUG 级别日志"
+    ),
 ) -> None:
     """启动 Mini-Claw 服务。"""
+    import logging
     import uvicorn
 
     from mini_claw.app import create_app
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     cfg = load_config(config_path)
     if host:
@@ -58,12 +70,17 @@ def run(
     if port:
         cfg.server.port = port
 
-    fastapi_app = create_app(cfg)
+    fastapi_app = create_app(cfg, config_path=config_path)
     console.print(
         f"[bold green]Mini-Claw 启动中...[/] "
         f"http://{cfg.server.host}:{cfg.server.port}"
     )
-    uvicorn.run(fastapi_app, host=cfg.server.host, port=cfg.server.port)
+    uvicorn.run(
+        fastapi_app,
+        host=cfg.server.host,
+        port=cfg.server.port,
+        log_level="info",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +98,7 @@ def chat(
     from mini_claw.app import create_components
 
     cfg = load_config(config_path)
-    components = create_components(cfg)
+    components = create_components(cfg, config_path=config_path)
 
     console.print("[bold]Mini-Claw 交互模式[/] (输入 /quit 退出)\n")
 
@@ -130,47 +147,60 @@ def chat(
 # mini-claw setup
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG_TOML = """\
-[provider]
-provider = "deepseek"
-api_key = ""
-model = "deepseek-chat"
+_DEFAULT_CONFIG_YAML = """\
+provider:
+  provider: deepseek
+  api_key: ""
+  model: deepseek-chat
 
-[channels.feishu]
-enabled = false
-app_id = ""
-app_secret = ""
-verification_token = ""
-encrypt_key = ""
+channels_feishu:
+  # 长连接（WebSocket）模式：只需 app_id / app_secret。
+  enabled: false
+  app_id: ""
+  app_secret: ""
 
-[server]
-host = "0.0.0.0"
-port = 8000
-public_url = ""
+server:
+  host: 0.0.0.0
+  port: 8000
+  public_url: ""
 
-[permissions]
-default_level = "L2"
+permissions:
+  default_level: L2
+  # sandbox_mode: "safe"（默认）= 路径只能在 workspace 内 + 敏感文件拦截；
+  #                "bypass"     = 关闭沙箱，agent 可读写整台电脑（仅在完全信任时使用）。
+  # bash 黑名单（rm -rf /、curl|sh 等）不论模式都生效。
+  sandbox_mode: safe
 
-[[agents]]
-id = "default"
-system_prompt = "你是一个高效的个人助手，能调用工具帮用户完成各种任务。"
-tools = ["run_shell", "read_file", "write_file", "list_directory"]
+agents:
+  - id: default
+    system_prompt: "你是一个高效的个人助手，能调用工具帮用户完成各种任务。"
+    tools:
+      - run_shell
+      - read_file
+      - write_file
+      - list_directory
 """
 
 
 @app.command()
-def setup() -> None:
-    """初始化配置目录，生成默认 config.toml。"""
-    config_dir = ensure_config_dir()
-    config_file = config_dir / "config.toml"
+def setup(
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径（默认：当前目录 config.yaml）"
+    ),
+) -> None:
+    """在当前目录生成默认 config.yaml。"""
+    config_file = get_config_path(config_path)
 
     if config_file.exists():
-        overwrite = typer.confirm("配置文件已存在，是否覆盖？", default=False)
+        overwrite = typer.confirm(
+            f"配置文件已存在 ({config_file})，是否覆盖？", default=False
+        )
         if not overwrite:
             console.print("[yellow]已取消。[/]")
             raise typer.Exit()
 
-    config_file.write_text(_DEFAULT_CONFIG_TOML, encoding="utf-8")
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(_DEFAULT_CONFIG_YAML, encoding="utf-8")
     console.print(f"[green]配置文件已创建:[/] {config_file}")
     console.print("请编辑配置文件填入 API Key 和飞书凭据。")
 
@@ -190,7 +220,7 @@ def doctor(
     all_ok = True
 
     # Check config file
-    path = config_path or DEFAULT_CONFIG_PATH
+    path = get_config_path(config_path)
     if path.exists():
         console.print(f"[green][OK][/] 配置文件: {path}")
     else:
@@ -216,7 +246,7 @@ def doctor(
         console.print("[yellow][-][/] 飞书: 未启用")
 
     # Check database
-    db_path = DEFAULT_CONFIG_DIR / "mini_claw.db"
+    db_path = _db_path(config_path)
     if db_path.exists():
         console.print(f"[green][OK][/] 数据库: {db_path}")
     else:
@@ -268,7 +298,7 @@ def tasks_list(
     """列出定时任务。"""
     from mini_claw.storage import Database
 
-    db_path = DEFAULT_CONFIG_DIR / "mini_claw.db"
+    db_path = _db_path(config_path)
     if not db_path.exists():
         console.print("[yellow]数据库尚未创建，无定时任务。[/]")
         raise typer.Exit()
@@ -297,11 +327,14 @@ def tasks_list(
 @tasks_app.command("remove")
 def tasks_remove(
     task_id: str = typer.Argument(help="要删除的任务 ID"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
 ) -> None:
     """删除指定的定时任务。"""
     from mini_claw.storage import Database
 
-    db_path = DEFAULT_CONFIG_DIR / "mini_claw.db"
+    db_path = _db_path(config_path)
     if not db_path.exists():
         console.print("[red]数据库不存在。[/]")
         raise typer.Exit(1)
@@ -323,11 +356,14 @@ def tasks_remove(
 @runs_app.command("show")
 def runs_show(
     run_id: str = typer.Argument(help="运行记录 ID"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
 ) -> None:
     """查看 Agent 运行详情（工具调用链、耗时、Token 用量）。"""
     from mini_claw.storage import Database
 
-    db_path = DEFAULT_CONFIG_DIR / "mini_claw.db"
+    db_path = _db_path(config_path)
     if not db_path.exists():
         console.print("[red]数据库不存在。[/]")
         raise typer.Exit(1)

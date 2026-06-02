@@ -34,6 +34,7 @@ class ToolContext:
     chat_id: str = ""
     agent_id: str = ""
     timeout: int = 30
+    sandbox_mode: str = "safe"  # "safe" or "bypass"
 
 
 class ToolRegistry:
@@ -57,10 +58,14 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
     def schemas_for(self, allowed: list[str]) -> list[dict[str, Any]]:
-        """Return JSON-Schema-style tool definitions for the allowed tools.
+        """Return raw tool specs for the allowed tools.
 
-        Each entry follows the OpenAI function-calling format:
-        {"type": "function", "function": {"name", "description", "parameters"}}
+        Each entry is provider-agnostic:
+            {"name": ..., "description": ..., "parameters": ...}
+
+        It is the provider's job (``Provider.format_tools``) to wrap these
+        into its wire format (e.g. OpenAI's
+        ``{"type": "function", "function": {...}}``).
         """
         results: list[dict[str, Any]] = []
         for name in allowed:
@@ -69,12 +74,9 @@ class ToolRegistry:
                 continue
             results.append(
                 {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    },
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
                 }
             )
         return results

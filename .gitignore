@@ -34,6 +34,7 @@ ENV/
 
 # Mini-Claw specific
 .mini-claw/
+config.yaml
 *.db
 *.db-journal
 

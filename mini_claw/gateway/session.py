@@ -8,6 +8,11 @@ from typing import Any
 from mini_claw.storage.db import Database
 
 
+# Configuration constants
+MAX_HISTORY_MESSAGES = 50  # Keep last N messages
+SYSTEM_SUMMARY_THRESHOLD = 40  # Trigger compression when exceeding this
+
+
 class SessionManager:
     """Manages chat sessions and message history."""
 
@@ -44,7 +49,24 @@ class SessionManager:
             "agent_id": agent_id,
             "created_at": now,
             "updated_at": now,
+            "sandbox_mode_override": None,
         }
+
+    def set_sandbox_mode(self, chat_id: str, agent_id: str, mode: str) -> None:
+        """Set sandbox_mode_override for a session ("safe", "bypass", or None)."""
+        self._storage.execute(
+            "UPDATE sessions SET sandbox_mode_override = ?, updated_at = ? "
+            "WHERE chat_id = ? AND agent_id = ?",
+            (mode, int(time.time()), chat_id, agent_id),
+        )
+
+    def get_sandbox_mode(self, chat_id: str, agent_id: str) -> str | None:
+        """Get sandbox_mode_override for a session, or None if not set."""
+        row = self._storage.fetchone(
+            "SELECT sandbox_mode_override FROM sessions WHERE chat_id = ? AND agent_id = ?",
+            (chat_id, agent_id),
+        )
+        return row["sandbox_mode_override"] if row else None
 
     def get_history(
         self, chat_id: str, agent_id: str, limit: int = 20
@@ -53,17 +75,69 @@ class SessionManager:
 
         Returns a list of message dicts with role and content keys,
         ordered chronologically (oldest first).
+
+        If the history exceeds SYSTEM_SUMMARY_THRESHOLD, applies compression:
+        - Keeps the first message (usually system prompt)
+        - Summarizes middle messages
+        - Keeps the last N messages intact
         """
-        rows = self._storage.fetchall(
+        # Get total count
+        count_row = self._storage.fetchone(
+            "SELECT COUNT(*) as cnt FROM messages "
+            "WHERE chat_id = ? AND agent_id = ?",
+            (chat_id, agent_id),
+        )
+        total_count = count_row["cnt"] if count_row else 0
+
+        # If under threshold, return all messages
+        if total_count <= SYSTEM_SUMMARY_THRESHOLD:
+            rows = self._storage.fetchall(
+                "SELECT role, content, tool_calls, tool_call_id "
+                "FROM messages "
+                "WHERE chat_id = ? AND agent_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (chat_id, agent_id, limit),
+            )
+            rows.reverse()
+            return self._rows_to_messages(rows)
+
+        # Compression: keep first + last N messages
+        keep_recent = 20
+        keep_first = 1
+
+        first_msgs = self._storage.fetchall(
+            "SELECT role, content, tool_calls, tool_call_id "
+            "FROM messages "
+            "WHERE chat_id = ? AND agent_id = ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (chat_id, agent_id, keep_first),
+        )
+
+        last_msgs = self._storage.fetchall(
             "SELECT role, content, tool_calls, tool_call_id "
             "FROM messages "
             "WHERE chat_id = ? AND agent_id = ? "
             "ORDER BY created_at DESC LIMIT ?",
-            (chat_id, agent_id, limit),
+            (chat_id, agent_id, keep_recent),
         )
-        # Reverse to chronological order
-        rows.reverse()
+        last_msgs.reverse()
 
+        # Build compressed history
+        messages = self._rows_to_messages(first_msgs)
+
+        # Add compression notice
+        compressed_count = total_count - keep_first - len(last_msgs)
+        if compressed_count > 0:
+            messages.append({
+                "role": "system",
+                "content": f"[Earlier {compressed_count} messages omitted for context length]"
+            })
+
+        messages.extend(self._rows_to_messages(last_msgs))
+        return messages
+
+    def _rows_to_messages(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert database rows to message dicts."""
         messages: list[dict[str, Any]] = []
         for row in rows:
             msg: dict[str, Any] = {"role": row["role"]}

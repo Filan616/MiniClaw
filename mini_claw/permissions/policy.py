@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from mini_claw.config import PermissionsConfig
+from mini_claw.utils.paths import assert_not_sensitive
 
 
 class PermissionPolicy:
@@ -22,8 +23,40 @@ class PermissionPolicy:
         return self._config
 
     def is_blacklisted(self, cmd: str) -> bool:
-        """Return True if *cmd* matches any shell_blacklist regex."""
+        """Return True if *cmd* matches any shell_blacklist regex.
+
+        Patterns are matched via ``re.search`` (anywhere-in-string). Do not
+        switch to ``fullmatch`` — the default patterns assume substring
+        semantics.
+        """
         return any(p.search(cmd) for p in self._blacklist_patterns)
+
+    def is_sensitive_path(self, path: str) -> bool:
+        """Return True if *path* points at a known-sensitive credential file.
+
+        Wraps :func:`mini_claw.utils.paths.assert_not_sensitive` and converts
+        the raised ``ValueError`` into a boolean. Useful at the policy layer
+        as a defense-in-depth complement to the tool-level check.
+        """
+        if not path:
+            return False
+        try:
+            assert_not_sensitive(path)
+        except ValueError:
+            return True
+        return False
+
+    def is_sensitive_path_allowlisted(self, path: str) -> bool:
+        """Exact-match allowlist for sensitive paths.
+
+        Reuses ``high_risk.allowed_command_templates`` as an opt-in list of
+        specific files the user wants to permit (e.g. a project-local
+        ``.env`` they explicitly want the agent to read). Match is exact
+        string equality — regex metacharacters are not honoured here, so
+        a stray ``.*`` cannot accidentally widen the allowlist.
+        """
+        templates = self._config.high_risk.allowed_command_templates or []
+        return any(t == path for t in templates)
 
     @staticmethod
     def path_in_workspace(path: str, workspace_dir: Path) -> bool:

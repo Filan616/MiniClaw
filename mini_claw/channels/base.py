@@ -36,3 +36,7 @@ class Channel(ABC):
     ) -> None:
         """Send an interactive approval card with approve/reject buttons."""
         ...
+
+    async def send_stream_chunk(self, chat_id: str, delta: str) -> None:
+        """Send a streaming text chunk (optional, default no-op)."""
+        pass

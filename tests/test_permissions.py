@@ -47,37 +47,23 @@ class TestPolicy:
 
 class TestPermissionGate:
     def test_allow_l0_tool(self, gate):
-        tool = MagicMock()
-        tool.name = "read_file"
-        tool.permission_level = L0
-        ctx = MagicMock()
-        ctx.workspace_dir = Path("/home/user/project")
-        decision = gate.evaluate(tool, {"path": "/home/user/project/f.txt"}, ctx)
+        ctx = {"level": L0, "workspace_dir": Path("/home/user/project")}
+        decision = gate.evaluate(
+            "read_file", {"path": "/home/user/project/f.txt"}, ctx
+        )
         assert decision.action == "allow"
 
     def test_deny_l4_tool(self, gate):
-        tool = MagicMock()
-        tool.name = "dangerous_op"
-        tool.permission_level = L4
-        ctx = MagicMock()
-        decision = gate.evaluate(tool, {}, ctx)
+        ctx = {"level": L4}
+        decision = gate.evaluate("dangerous_op", {}, ctx)
         assert decision.action == "deny"
 
     def test_l3_needs_approval(self, gate):
-        tool = MagicMock()
-        tool.name = "send_message"
-        tool.permission_level = L3
-        ctx = MagicMock()
-        ctx.chat_id = "chat_001"
-        ctx.agent_id = "default"
-        decision = gate.evaluate(tool, {}, ctx)
+        ctx = {"level": L3, "chat_id": "chat_001", "agent_id": "default"}
+        decision = gate.evaluate("send_message", {}, ctx)
         assert decision.action == "need_approval"
 
     def test_shell_blacklist_deny(self, gate):
-        tool = MagicMock()
-        tool.name = "run_shell"
-        tool.permission_level = L2
-        ctx = MagicMock()
-        ctx.workspace_dir = Path("/home/user/project")
-        decision = gate.evaluate(tool, {"cmd": "rm -rf /"}, ctx)
+        ctx = {"level": L2, "workspace_dir": Path("/home/user/project")}
+        decision = gate.evaluate("run_shell", {"cmd": "rm -rf /"}, ctx)
         assert decision.action == "deny"

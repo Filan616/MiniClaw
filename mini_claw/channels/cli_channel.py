@@ -20,9 +20,23 @@ class Gateway(Protocol):
 class CLIChannel(Channel):
     """Local testing channel that uses stdin/stdout."""
 
+    def __init__(self) -> None:
+        self._stream_buffer = ""
+
     async def send(self, chat_id: str, text: str) -> None:
         """Print the message to stdout."""
+        # Flush any pending stream
+        if self._stream_buffer:
+            print()  # Newline after stream
+            self._stream_buffer = ""
         print(f"\n[bot -> {chat_id}] {text}")
+
+    async def send_stream_chunk(self, chat_id: str, delta: str) -> None:
+        """Print streaming chunks in real-time."""
+        if not self._stream_buffer:
+            print(f"\n[bot -> {chat_id}] ", end="", flush=True)
+        print(delta, end="", flush=True)
+        self._stream_buffer += delta
 
     async def send_approval_card(
         self,

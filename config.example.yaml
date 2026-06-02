@@ -1,0 +1,57 @@
+# Mini-Claw 默认配置文件
+# 复制此文件到当前目录的 config.yaml 并填入你的配置
+
+provider:
+  provider: deepseek
+  api_key: "sk-your-api-key-here"
+  model: deepseek-chat
+  # base_url: ""   # 自定义 API 地址（可选）
+
+channels_feishu:
+  # 长连接（WebSocket）模式：只需 app_id / app_secret，
+  # 无需 Webhook URL、verification_token 或 encrypt_key。
+  enabled: false
+  app_id: "cli_xxx"
+  app_secret: "your-app-secret"
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  public_url: "https://your-host.example.com"
+
+permissions:
+  default_level: L2
+  # sandbox_mode: "safe"   = 路径限制在 workspace 内 + 敏感文件拦截（推荐）
+  #                "bypass" = 关闭沙箱，agent 可读写整台电脑（仅在你完全信任时使用）
+  # bash 黑名单不论模式都生效，作为最后一道安全网。
+  sandbox_mode: safe
+  require_confirm:
+    - L3
+  deny_by_default:
+    - L4
+  shell_blacklist:
+    - 'rm\s+-rf\s+/'
+    - 'mkfs'
+    - ':\(\)\{'
+  high_risk:
+    allow_explicit: false
+    allowed_command_templates: []
+
+agents:
+  - id: default
+    system_prompt: "你是一个高效的个人助手，能调用工具帮用户完成各种任务。请用中文回复。"
+    tools:
+      - run_shell
+      - read_file
+      - write_file
+      - list_directory
+      - http_request
+
+  # 示例：运维专用 agent
+  # - id: ops
+  #   system_prompt: "你是运维专家，只做服务器运维相关任务。"
+  #   tools:
+  #     - run_shell
+  #     - read_file
+  #   route_chat_ids:
+  #     - oc_xxxx

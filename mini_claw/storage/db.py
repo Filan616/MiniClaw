@@ -44,16 +44,33 @@ class Database:
     def init_tables(self) -> None:
         """Create all tables and indexes if they do not exist."""
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Apply schema migrations for existing databases."""
+        # Migration 1: Add sandbox_mode_override to sessions
+        try:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN sandbox_mode_override TEXT"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            # Column already exists, safe to ignore
+            pass
 
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        return self._conn.execute(sql, params)
+        cursor = self._conn.execute(sql, params)
+        self._conn.commit()
+        return cursor
 
     def executemany(self, sql: str, seq: list[tuple]) -> sqlite3.Cursor:
-        return self._conn.executemany(sql, seq)
+        cursor = self._conn.executemany(sql, seq)
+        self._conn.commit()
+        return cursor
 
     def fetchone(self, sql: str, params: tuple = ()) -> dict[str, Any] | None:
         row = self._conn.execute(sql, params).fetchone()
@@ -130,7 +147,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id      TEXT PRIMARY KEY,
     agent_id     TEXT NOT NULL,
     created_at   INTEGER,
-    updated_at   INTEGER
+    updated_at   INTEGER,
+    sandbox_mode_override TEXT  -- "safe", "bypass", or NULL (use config default)
 );
 
 CREATE TABLE IF NOT EXISTS messages (

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from mini_claw.utils.paths import assert_not_sensitive, ensure_inside
+from mini_claw.utils.paths import (
+    SensitivePathError,
+    WorkspaceEscapeError,
+    assert_not_sensitive,
+    ensure_inside,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,3 +114,57 @@ def test_assert_not_sensitive_blocks(path: str) -> None:
 )
 def test_assert_not_sensitive_allows(path: str) -> None:
     assert_not_sensitive(path)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Exception type contract — code that classifies path errors should rely on
+# isinstance, not substring matching of the message. (Phase 0.6)
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_escape_error_is_value_error_subclass(tmp_path: Path) -> None:
+    """ensure_inside raises WorkspaceEscapeError, which subclasses ValueError
+    so legacy callers using ``except ValueError`` keep working."""
+    outside = tmp_path.parent / "outside.txt"
+    with pytest.raises(WorkspaceEscapeError) as exc_info:
+        ensure_inside(str(outside), tmp_path)
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_sensitive_path_error_pattern_match() -> None:
+    """assert_not_sensitive raises SensitivePathError on filename pattern."""
+    with pytest.raises(SensitivePathError) as exc_info:
+        assert_not_sensitive(".env")
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_sensitive_path_error_segment_match() -> None:
+    """assert_not_sensitive raises SensitivePathError on segment pattern."""
+    with pytest.raises(SensitivePathError) as exc_info:
+        assert_not_sensitive(".ssh/known_hosts")
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_sensitive_path_error_sequence_match() -> None:
+    """assert_not_sensitive raises SensitivePathError on segment sequence."""
+    with pytest.raises(SensitivePathError) as exc_info:
+        assert_not_sensitive(".git/config")
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_workspace_escape_and_sensitive_are_distinct(tmp_path: Path) -> None:
+    """The two error classes are siblings, not in an inheritance chain.
+
+    A WorkspaceEscapeError must NOT be misclassified as a SensitivePathError
+    (or vice versa) by isinstance checks in _handle_path_error.
+    """
+    outside = tmp_path.parent / "outside.txt"
+    try:
+        ensure_inside(str(outside), tmp_path)
+    except WorkspaceEscapeError as exc:
+        assert not isinstance(exc, SensitivePathError)
+
+    try:
+        assert_not_sensitive(".env")
+    except SensitivePathError as exc:
+        assert not isinstance(exc, WorkspaceEscapeError)

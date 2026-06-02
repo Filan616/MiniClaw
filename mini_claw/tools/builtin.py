@@ -6,8 +6,49 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from ..utils.paths import assert_not_sensitive, ensure_inside
+from ..utils.paths import (
+    SensitivePathError,
+    WorkspaceEscapeError,
+    assert_not_sensitive,
+    ensure_inside,
+)
 from .registry import Tool, ToolContext
+
+
+# ---------------------------------------------------------------------------
+# Error message obfuscation helpers
+# ---------------------------------------------------------------------------
+
+def _obfuscate_path_escape(original_path: str, exc: ValueError, *, ctx: ToolContext) -> str:
+    """Semi-obfuscated message for path escape attempts.
+
+    Tier 2: Path escape - reveal it's a path issue but not the exact path.
+    """
+    if ctx.audit_logger:
+        debug_id = ctx.audit_logger.log_security_event(
+            event_type="path_escape_attempt",
+            details={"requested_path": original_path, "error": str(exc)},
+            chat_id=ctx.chat_id,
+            agent_id=ctx.agent_id,
+        )
+        return f"[ERROR] Path outside workspace. debug_id={debug_id}"
+    return "[ERROR] Path outside workspace"
+
+
+def _obfuscate_sensitive_path(original_path: str, exc: ValueError, *, ctx: ToolContext) -> str:
+    """Fully obfuscated message for sensitive path access.
+
+    Tier 3: Security policy hit - fully obfuscated with debug_id.
+    """
+    if ctx.audit_logger:
+        debug_id = ctx.audit_logger.log_security_event(
+            event_type="sensitive_path_access",
+            details={"requested_path": original_path, "error": str(exc)},
+            chat_id=ctx.chat_id,
+            agent_id=ctx.agent_id,
+        )
+        return f"[denied] Access denied. debug_id={debug_id}"
+    return "[denied] Access denied"
 
 
 def _bypass_resolve(path: str, workspace: Path) -> Path:
@@ -20,6 +61,26 @@ def _bypass_resolve(path: str, workspace: Path) -> Path:
     if p.is_absolute():
         return p.resolve()
     return (workspace / p).resolve()
+
+
+def _handle_path_error(original_path: str, exc: ValueError, *, ctx: ToolContext) -> str:
+    """Route path validation errors to appropriate obfuscation tier.
+
+    Classification is by exception *type* rather than substring matching, so
+    callers (and ``mini_claw.utils.paths``) can adjust message wording without
+    silently downgrading the obfuscation tier.
+
+    - :class:`WorkspaceEscapeError` -> tier 2 (semi-obfuscated, "Path outside
+      workspace.")
+    - :class:`SensitivePathError`   -> tier 3 (fully obfuscated, "Access
+      denied.")
+    - Any other ``ValueError``      -> tier 1 (recoverable, message preserved)
+    """
+    if isinstance(exc, WorkspaceEscapeError):
+        return _obfuscate_path_escape(original_path, exc, ctx=ctx)
+    if isinstance(exc, SensitivePathError):
+        return _obfuscate_sensitive_path(original_path, exc, ctx=ctx)
+    return f"[ERROR] {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +101,7 @@ async def _run_shell(command: str, *, ctx: ToolContext) -> str:
         )
     except asyncio.TimeoutError:
         proc.kill()  # type: ignore[union-attr]
+        # Tier 1: Recoverable error - specific timeout info
         return f"[ERROR] Command timed out after {ctx.timeout}s"
 
     output_parts: list[str] = []
@@ -81,12 +143,16 @@ async def _read_file(path: str, *, ctx: ToolContext) -> str:
             file_path = ensure_inside(path, ctx.workspace_dir)
             assert_not_sensitive(file_path.relative_to(ctx.workspace_dir.resolve()))
     except ValueError as exc:
-        return f"[ERROR] {exc}"
+        return _handle_path_error(path, exc, ctx=ctx)
+
     if not file_path.is_file():
-        return f"[ERROR] File not found: {file_path}"
+        # Tier 1: Recoverable error - keep specific info
+        return f"[ERROR] File not found: {path}"
+
     try:
         return file_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        # Tier 1: Recoverable error - show OS error details
         return f"[ERROR] Cannot read file: {exc}"
 
 
@@ -118,12 +184,14 @@ async def _write_file(path: str, content: str, *, ctx: ToolContext) -> str:
             file_path = ensure_inside(path, ctx.workspace_dir)
             assert_not_sensitive(file_path.relative_to(ctx.workspace_dir.resolve()))
     except ValueError as exc:
-        return f"[ERROR] {exc}"
+        return _handle_path_error(path, exc, ctx=ctx)
+
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
-        return f"Written {len(content)} chars to {file_path}"
+        return f"Written {len(content)} chars to {path}"
     except OSError as exc:
+        # Tier 1: Recoverable error - show OS error details
         return f"[ERROR] Cannot write file: {exc}"
 
 
@@ -154,10 +222,14 @@ async def _list_directory(path: str = ".", *, ctx: ToolContext) -> str:
             dir_path = _bypass_resolve(path, ctx.workspace_dir)
         else:
             dir_path = ensure_inside(path, ctx.workspace_dir)
+            assert_not_sensitive(dir_path.relative_to(ctx.workspace_dir.resolve()))
     except ValueError as exc:
-        return f"[ERROR] {exc}"
+        return _handle_path_error(path, exc, ctx=ctx)
+
     if not dir_path.is_dir():
-        return f"[ERROR] Not a directory: {dir_path}"
+        # Tier 1: Recoverable error - keep specific info
+        return f"[ERROR] Not a directory: {path}"
+
     try:
         entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
         lines: list[str] = []
@@ -166,6 +238,7 @@ async def _list_directory(path: str = ".", *, ctx: ToolContext) -> str:
             lines.append(f"{prefix}{entry.name}")
         return "\n".join(lines) if lines else "(empty directory)"
     except OSError as exc:
+        # Tier 1: Recoverable error - show OS error details
         return f"[ERROR] Cannot list directory: {exc}"
 
 

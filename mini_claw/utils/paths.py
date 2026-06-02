@@ -22,6 +22,26 @@ import fnmatch
 from pathlib import Path
 
 
+class WorkspaceEscapeError(ValueError):
+    """Raised by ``ensure_inside`` when a path resolves outside the workspace.
+
+    Subclass of ``ValueError`` so existing callers using
+    ``pytest.raises(ValueError, match=...)`` and broad ``except ValueError``
+    blocks keep working. Tools should ``isinstance``-check this type to
+    classify the error tier without relying on substring matching of the
+    message.
+    """
+
+
+class SensitivePathError(ValueError):
+    """Raised by ``assert_not_sensitive`` when the path matches a sensitive
+    pattern or segment (``.env``, ``.ssh/*``, ``id_rsa``, …).
+
+    Subclass of ``ValueError`` for the same backwards-compat reason as
+    :class:`WorkspaceEscapeError`.
+    """
+
+
 _SENSITIVE_PATTERNS: tuple[str, ...] = (
     ".env",
     ".env.*",
@@ -73,7 +93,7 @@ def ensure_inside(path: str | Path, base: Path) -> Path:
     try:
         resolved.relative_to(base_resolved)
     except ValueError as exc:
-        raise ValueError(f"path escapes workspace: {path!r}") from exc
+        raise WorkspaceEscapeError(f"path escapes workspace: {path!r}") from exc
     return resolved
 
 
@@ -93,12 +113,12 @@ def assert_not_sensitive(path: str | Path) -> None:
     for pattern in _SENSITIVE_PATTERNS:
         # fnmatch.fnmatchcase is case-sensitive; we already lowercased.
         if fnmatch.fnmatchcase(name_lower, pattern):
-            raise ValueError(
+            raise SensitivePathError(
                 f"path matches sensitive pattern {pattern!r}: {path}"
             )
         for seg in parts_lower:
             if fnmatch.fnmatchcase(seg, pattern):
-                raise ValueError(
+                raise SensitivePathError(
                     f"path segment matches sensitive pattern {pattern!r}: {path}"
                 )
 
@@ -106,6 +126,6 @@ def assert_not_sensitive(path: str | Path) -> None:
         n = len(seq)
         for i in range(len(parts_lower) - n + 1):
             if parts_lower[i : i + n] == seq:
-                raise ValueError(
+                raise SensitivePathError(
                     f"path contains sensitive segment {'/'.join(seq)!r}: {path}"
                 )

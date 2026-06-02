@@ -70,7 +70,7 @@ def create_components(
     storage = Database(db_path)
 
     # Provider manager (Phase 1.3)
-    provider_manager = ProviderManager(config)
+    provider_manager = ProviderManager(config, storage=storage)
 
     # Tool registry
     registry = ToolRegistry()

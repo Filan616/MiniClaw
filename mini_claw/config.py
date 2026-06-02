@@ -222,6 +222,8 @@ class AgentConfig(BaseModel):
     system_prompt: str = "你是一个高效的个人助手，能调用工具帮用户完成各种任务。"
     workspace: str | None = None
     provider: ProviderConfig | None = None
+    provider_fallback: list[ProviderConfig] = Field(default_factory=list)
+    """Phase B.7: ordered fallback providers when primary fails."""
     model: str | None = None
     enabled: bool = True
     tools: list[str] = Field(

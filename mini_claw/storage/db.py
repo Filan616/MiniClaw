@@ -231,6 +231,13 @@ class Database:
             except sqlite3.OperationalError:
                 pass
 
+        # Migration 9 (Phase B.7): Sessions provider_id binding for fallback consistency.
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN provider_id TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         # Migration 7 (Phase C6): Session composite primary key.
         # Rebuild sessions table with composite PK (channel_name, chat_id, agent_id)
         # to support same chat_id across different channels.
@@ -441,6 +448,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     channel_name TEXT NOT NULL DEFAULT 'feishu',
     thread_id    TEXT DEFAULT NULL,
     sandbox_mode_override TEXT,  -- "safe", "bypass", or NULL (use config default)
+    provider_id  TEXT,  -- Phase B.7: bound provider for session-consistent fallback
     PRIMARY KEY (channel_name, chat_id, agent_id)
 );
 
@@ -584,6 +592,16 @@ CREATE TABLE IF NOT EXISTS session_chain_state (
 
 CREATE INDEX IF NOT EXISTS idx_session_chain_expires
 ON session_chain_state(expires_at);
+
+-- Phase B.7: Provider health tracking for fallback.
+CREATE TABLE IF NOT EXISTS provider_health (
+    provider_id           TEXT PRIMARY KEY,
+    last_check_at         INTEGER,
+    last_ok_at            INTEGER,
+    last_error            TEXT,
+    consecutive_failures  INTEGER DEFAULT 0,
+    healthy               INTEGER DEFAULT 1
+);
 
 -- Observability group
 CREATE TABLE IF NOT EXISTS agent_runs (

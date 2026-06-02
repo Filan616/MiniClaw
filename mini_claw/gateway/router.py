@@ -216,14 +216,19 @@ class Gateway:
 
         # Persist run state to agent_runs table
         now = int(time.time())
+        # Phase B.4: Compute total_tokens from prompt + completion (best-effort)
+        prompt_tokens = getattr(run, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(run, "completion_tokens", 0) or 0
+        total_tokens = prompt_tokens + completion_tokens
         self._storage.execute(
             "UPDATE agent_runs SET status=?, final_answer=?, iterations=?, "
-            "pending_tool_call=?, updated_at=? WHERE id=?",
+            "pending_tool_call=?, total_tokens=?, updated_at=? WHERE id=?",
             (
                 _status_value(run.status),
                 run.final_answer,
                 run.iterations,
                 run.pending_tool_call,
+                total_tokens,
                 now,
                 run_id,
             ),
@@ -440,6 +445,7 @@ class Gateway:
                 chain_detector=self._chain_detector,
                 system_prompt=agent_cfg.system_prompt,
                 skill_manager=self._skill_manager,
+                storage=self._storage,
             )
 
             # Load conversation history for context
@@ -576,6 +582,7 @@ class Gateway:
             chain_detector=self._chain_detector,
             system_prompt=agent_cfg.system_prompt,
             skill_manager=self._skill_manager,
+            storage=self._storage,
         )
 
         history = self._session_mgr.get_history(
@@ -613,9 +620,15 @@ class Gateway:
             if run.final_answer:
                 await channel.send(run_row["chat_id"], run.final_answer)
 
+            # Phase B.4: Compute total_tokens
+            prompt_tokens_resume = getattr(run, "prompt_tokens", 0) or 0
+            completion_tokens_resume = getattr(run, "completion_tokens", 0) or 0
+            total_tokens_resume = prompt_tokens_resume + completion_tokens_resume
             self._storage.execute(
-                "UPDATE agent_runs SET status = ?, final_answer = ?, iterations = ?, updated_at = ? WHERE id = ?",
-                (_status_value(run.status), run.final_answer, run.iterations, int(time.time()), run.id),
+                "UPDATE agent_runs SET status = ?, final_answer = ?, iterations = ?, "
+                "total_tokens = ?, updated_at = ? WHERE id = ?",
+                (_status_value(run.status), run.final_answer, run.iterations,
+                 total_tokens_resume, int(time.time()), run.id),
             )
 
         # ========== Resume run with workspace lock ==========
@@ -949,6 +962,7 @@ class Gateway:
             chain_detector=self._chain_detector,
             system_prompt=agent_cfg.system_prompt,
             skill_manager=self._skill_manager,
+            storage=self._storage,
         )
         runner = WorkflowRunner(
             config=self._config.workflow,

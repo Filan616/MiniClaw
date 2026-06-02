@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -180,11 +181,16 @@ async def _process_single_tool_call(
                 "content": f"[denied] Chain attack detected. debug_id={debug_id}",
             }
 
+    # Phase B.4: Record tool call duration
+    start_time = time.monotonic()
+    tool_status = "ok"
     try:
         result = await tool.handler(**tc.arguments, ctx=tool_ctx)
     except TypeError as exc:
         result = f"[error] tool {tc.name} rejected arguments: {exc}"
+        tool_status = "error"
     except Exception as exc:
+        tool_status = "error"
         if result_processor:
             result = result_processor.process_error(exc)
         else:
@@ -192,6 +198,10 @@ async def _process_single_tool_call(
     else:
         if result_processor:
             result = result_processor.process(result, tc.name)
+    duration_ms = int((time.monotonic() - start_time) * 1000)
+
+    # Persist tool_call record (Phase B.4)
+    _persist_tool_call(ctx, run.id, tc, result, tool_status, duration_ms)
 
     # Chain attack detection (post-tool observation)
     if hasattr(ctx, "chain_detector") and ctx.chain_detector:
@@ -202,6 +212,38 @@ async def _process_single_tool_call(
         "tool_call_id": tc.id,
         "content": result,
     }
+
+
+def _persist_tool_call(
+    ctx: AgentContext, run_id: str, tc: Any, result: str, status: str, duration_ms: int
+) -> None:
+    """Persist a tool_call record with duration_ms (Phase B.4)."""
+    storage = getattr(ctx, "storage", None)
+    if storage is None:
+        return
+    try:
+        now = int(time.time())
+        tc_id = getattr(tc, "id", None) or str(uuid.uuid4())
+        storage.execute(
+            "INSERT OR REPLACE INTO tool_calls "
+            "(id, run_id, tool_name, arguments, result, status, "
+            " created_at, finished_at, duration_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tc_id,
+                run_id,
+                tc.name,
+                json.dumps(tc.arguments) if tc.arguments else None,
+                result[:5000] if isinstance(result, str) else str(result)[:5000],
+                status,
+                now,
+                now,
+                duration_ms,
+            ),
+        )
+    except Exception:
+        # Stats persistence is best-effort; failure should not break the run
+        pass
 
 
 async def _process_tool_calls_parallel(

@@ -30,12 +30,14 @@ skills_app = typer.Typer(help="Skill 管理")
 plugins_app = typer.Typer(help="Plugin 管理")
 tasks_app = typer.Typer(help="定时任务管理")
 runs_app = typer.Typer(help="运行记录查看")
+stats_app = typer.Typer(help="使用统计 (token/耗时)")
 
 app.add_typer(agents_app, name="agents")
 app.add_typer(skills_app, name="skills")
 app.add_typer(plugins_app, name="plugins")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(runs_app, name="runs")
+app.add_typer(stats_app, name="stats")
 
 console = Console()
 
@@ -799,3 +801,109 @@ def runs_show(
             name = tc.get("tool", tc.get("name", "?"))
             status = tc.get("status", "ok")
             console.print(f"  {i}. {name} [{status}]")
+
+
+# ---------------------------------------------------------------------------
+# Stats commands (Phase B.4)
+# ---------------------------------------------------------------------------
+
+
+def _stats_storage(config_path: Optional[Path]) -> "Database":
+    """Open Database for stats queries (no full app bootstrap needed)."""
+    from mini_claw.config import get_data_dir
+    from mini_claw.storage import Database
+    data_dir = get_data_dir(config_path)
+    return Database(data_dir / "mini_claw.db")
+
+
+@stats_app.command("session")
+def stats_session(
+    chat_id: str = typer.Argument(help="Chat ID to summarize"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Show token usage and tool call summary for a session."""
+    storage = _stats_storage(config_path)
+
+    # Aggregate runs for this chat_id
+    runs = storage.fetchall(
+        "SELECT COUNT(*) AS n_runs, "
+        "SUM(COALESCE(prompt_tokens, 0)) AS prompt, "
+        "SUM(COALESCE(completion_tokens, 0)) AS completion, "
+        "SUM(COALESCE(total_tokens, 0)) AS total, "
+        "SUM(COALESCE(total_cost_usd, 0)) AS cost "
+        "FROM agent_runs WHERE chat_id = ?",
+        (chat_id,),
+    )
+    summary = runs[0] if runs else {}
+    n_runs = summary.get("n_runs") or 0
+    prompt_t = summary.get("prompt") or 0
+    completion_t = summary.get("completion") or 0
+    total_t = summary.get("total") or 0
+    cost = summary.get("cost") or 0.0
+
+    # Tool call stats
+    tools = storage.fetchall(
+        "SELECT COUNT(*) AS n, AVG(COALESCE(duration_ms, 0)) AS avg_ms, "
+        "MAX(COALESCE(duration_ms, 0)) AS max_ms "
+        "FROM tool_calls tc JOIN agent_runs ar ON tc.run_id = ar.id "
+        "WHERE ar.chat_id = ?",
+        (chat_id,),
+    )
+    t_summary = tools[0] if tools else {}
+    n_calls = t_summary.get("n") or 0
+    avg_ms = t_summary.get("avg_ms") or 0
+    max_ms = t_summary.get("max_ms") or 0
+
+    table = Table(title=f"Session stats: {chat_id}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value")
+    table.add_row("Total runs", str(n_runs))
+    table.add_row("Prompt tokens", str(int(prompt_t)))
+    table.add_row("Completion tokens", str(int(completion_t)))
+    table.add_row("Total tokens", str(int(total_t)))
+    table.add_row("Estimated cost (USD)", f"${cost:.4f}")
+    table.add_row("Tool calls", str(n_calls))
+    table.add_row("Avg tool duration (ms)", f"{avg_ms:.1f}")
+    table.add_row("Max tool duration (ms)", str(int(max_ms)))
+    console.print(table)
+
+
+@stats_app.command("top-tools")
+def stats_top_tools(
+    limit: int = typer.Option(10, "--limit", "-n", help="Number of tools to show"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Show top tools by average duration."""
+    storage = _stats_storage(config_path)
+    rows = storage.fetchall(
+        "SELECT tool_name, COUNT(*) AS n, "
+        "AVG(COALESCE(duration_ms, 0)) AS avg_ms, "
+        "MAX(COALESCE(duration_ms, 0)) AS max_ms, "
+        "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors "
+        "FROM tool_calls "
+        "WHERE duration_ms IS NOT NULL "
+        "GROUP BY tool_name "
+        "ORDER BY avg_ms DESC "
+        "LIMIT ?",
+        (limit,),
+    )
+
+    table = Table(title=f"Top {limit} tools by avg duration")
+    table.add_column("Tool", style="cyan")
+    table.add_column("Calls", justify="right")
+    table.add_column("Avg (ms)", justify="right")
+    table.add_column("Max (ms)", justify="right")
+    table.add_column("Errors", justify="right")
+    for row in rows:
+        table.add_row(
+            row["tool_name"],
+            str(row["n"]),
+            f"{(row['avg_ms'] or 0):.1f}",
+            str(int(row["max_ms"] or 0)),
+            str(row["errors"] or 0),
+        )
+    console.print(table)

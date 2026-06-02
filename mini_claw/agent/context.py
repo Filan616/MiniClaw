@@ -21,3 +21,4 @@ class AgentContext:
     chain_detector: Any = None  # ChainDetector instance
     system_prompt: str | None = None
     skill_manager: Any = None
+    storage: Any = None  # Database for stats persistence (Phase B.4)

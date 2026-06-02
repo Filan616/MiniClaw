@@ -218,6 +218,19 @@ class Database:
             except sqlite3.OperationalError:
                 pass
 
+        # Migration 8 (Phase B.4): Stats columns for token aggregation and tool duration.
+        stats_migrations = [
+            "ALTER TABLE agent_runs ADD COLUMN total_tokens INTEGER DEFAULT 0",
+            "ALTER TABLE agent_runs ADD COLUMN total_cost_usd REAL DEFAULT 0.0",
+            "ALTER TABLE tool_calls ADD COLUMN duration_ms INTEGER",
+        ]
+        for migration in stats_migrations:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
         # Migration 7 (Phase C6): Session composite primary key.
         # Rebuild sessions table with composite PK (channel_name, chat_id, agent_id)
         # to support same chat_id across different channels.
@@ -586,6 +599,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     pending_tool_call   TEXT,
     prompt_tokens       INTEGER DEFAULT 0,
     completion_tokens   INTEGER DEFAULT 0,
+    total_tokens        INTEGER DEFAULT 0,
+    total_cost_usd      REAL DEFAULT 0.0,
     created_at          INTEGER,
     updated_at          INTEGER
 );
@@ -599,6 +614,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     status       TEXT NOT NULL,
     created_at   INTEGER,
     finished_at  INTEGER,
+    duration_ms  INTEGER,
     FOREIGN KEY (run_id) REFERENCES agent_runs(id)
 );
 

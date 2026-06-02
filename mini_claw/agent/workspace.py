@@ -46,7 +46,7 @@ class WorkspaceManager:
                 route_chat_ids=list(agent_cfg.route_chat_ids),
             )
             if self._base_dir is not None:
-                ws.workspace_dir = self._base_dir / agent_cfg.id
+                ws.workspace_dir = self._base_dir / (agent_cfg.workspace or agent_cfg.id)
                 ws.workspace_dir.mkdir(parents=True, exist_ok=True)
             self._workspaces[ws.agent_id] = ws
 
@@ -78,7 +78,12 @@ class WorkspaceManager:
         ``agent_id`` argument is accepted for caller convenience; the actual
         routing is done by ``chat_id``.
         """
-        ws = self.get_workspace_for_chat(chat_id)
+        if agent_id is not None:
+            ws = self._workspaces.get(agent_id)
+            if ws is None:
+                raise ValueError(f"No workspace found for agent_id={agent_id!r}")
+        else:
+            ws = self.get_workspace_for_chat(chat_id)
         if ws.workspace_dir is None:
             raise RuntimeError(
                 "WorkspaceManager has no base_dir configured; "

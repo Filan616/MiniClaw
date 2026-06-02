@@ -34,6 +34,7 @@ class ApprovalStore:
         tool_name: str,
         tool_args: dict,
         expires_at: int,
+        approval_type: str = "tool",
     ) -> None:
         """Create a pending approval record.
 
@@ -49,9 +50,19 @@ class ApprovalStore:
         now = int(time.time())
         self._storage.execute(
             "INSERT INTO pending_approvals "
-            "(id, run_id, chat_id, agent_id, tool_name, tool_args, status, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (approval_id, run_id, chat_id, agent_id, tool_name, json.dumps(tool_args), now, expires_at),
+            "(id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (
+                approval_id,
+                run_id,
+                chat_id,
+                agent_id,
+                tool_name,
+                json.dumps(tool_args),
+                approval_type,
+                now,
+                expires_at,
+            ),
         )
 
     def resolve_pending(self, approval_id: str, decision: str) -> Optional[dict[str, Any]]:
@@ -65,7 +76,7 @@ class ApprovalStore:
             The resolved record as dict, or None if not found / already resolved.
         """
         record = self._storage.fetchone(
-            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, expires_at "
+            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, expires_at "
             "FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
@@ -93,6 +104,7 @@ class ApprovalStore:
             "run_id": record["run_id"],
             "chat_id": record["chat_id"],
             "agent_id": record["agent_id"],
+            "approval_type": record.get("approval_type") or "tool",
         }
 
     def get_pending(self, approval_id: str) -> Optional[dict[str, Any]]:
@@ -102,7 +114,7 @@ class ApprovalStore:
             The record as dict, or None if not found.
         """
         record = self._storage.fetchone(
-            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, created_at, expires_at "
+            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, created_at, expires_at "
             "FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
@@ -117,6 +129,7 @@ class ApprovalStore:
             "tool_name": record["tool_name"],
             "tool_args": json.loads(record["tool_args"]),
             "status": record["status"],
+            "approval_type": record.get("approval_type") or "tool",
             "created_at": record["created_at"],
             "expires_at": record["expires_at"],
         }

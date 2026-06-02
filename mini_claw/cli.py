@@ -12,7 +12,9 @@ from rich.console import Console
 from rich.table import Table
 
 from mini_claw.config import (
+    AgentConfig,
     AppConfig,
+    ProviderConfig,
     get_config_path,
     get_data_dir,
     load_config,
@@ -24,10 +26,14 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 agents_app = typer.Typer(help="Agent 管理")
+skills_app = typer.Typer(help="Skill 管理")
+plugins_app = typer.Typer(help="Plugin 管理")
 tasks_app = typer.Typer(help="定时任务管理")
 runs_app = typer.Typer(help="运行记录查看")
 
 app.add_typer(agents_app, name="agents")
+app.add_typer(skills_app, name="skills")
+app.add_typer(plugins_app, name="plugins")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(runs_app, name="runs")
 
@@ -36,6 +42,51 @@ console = Console()
 
 def _db_path(config_path: Optional[Path]) -> Path:
     return get_data_dir(config_path) / "mini_claw.db"
+
+
+def _agent_manager(config_path: Optional[Path]):
+    from mini_claw.agent.manager import AgentManager
+    from mini_claw.agent.workspace import WorkspaceManager
+    from mini_claw.storage import Database
+
+    cfg = load_config(config_path)
+    data_dir = get_data_dir(config_path)
+    db = Database(data_dir / "mini_claw.db")
+    workspace_manager = WorkspaceManager(base_dir=data_dir / "workspaces")
+    workspace_manager.load_workspaces(cfg.agents)
+    return AgentManager(db, cfg, workspace_manager)
+
+
+def _skill_manager(config_path: Optional[Path]):
+    from mini_claw.skills.manager import SkillManager
+    from mini_claw.storage import Database
+
+    data_dir = get_data_dir(config_path)
+    db = Database(data_dir / "mini_claw.db")
+    return SkillManager(db, Path.cwd() / "skills")
+
+
+def _plugin_manager(config_path: Optional[Path]):
+    from mini_claw.channels.manager import ChannelManager
+    from mini_claw.plugins.manager import PluginManager
+    from mini_claw.providers.manager import ProviderManager
+    from mini_claw.storage import Database
+    from mini_claw.tools.builtin import BUILTIN_TOOLS
+    from mini_claw.tools.registry import ToolRegistry
+
+    cfg = load_config(config_path)
+    data_dir = get_data_dir(config_path)
+    db = Database(data_dir / "mini_claw.db")
+    registry = ToolRegistry()
+    for tool in BUILTIN_TOOLS:
+        registry.register(tool)
+    return PluginManager(
+        plugins_dir=data_dir / "plugins",
+        registry=registry,
+        channel_manager=ChannelManager(cfg),
+        provider_manager=ProviderManager(cfg),
+        storage=db,
+    )
 
 # ---------------------------------------------------------------------------
 # mini-claw run
@@ -93,53 +144,30 @@ def chat(
     config_path: Optional[Path] = typer.Option(
         None, "--config", "-c", help="配置文件路径"
     ),
+    agent_id: str = typer.Option("default", "--agent", help="Agent ID"),
 ) -> None:
     """交互式聊天模式（本地测试，无需飞书）。"""
     from mini_claw.app import create_components
+    from mini_claw.channels.cli_channel import CLIChannel
 
     cfg = load_config(config_path)
     components = create_components(cfg, config_path=config_path)
+    agent_manager = components["agent_manager"]
+    channel_manager = components["channel_manager"]
+    gateway = components["gateway"]
 
-    console.print("[bold]Mini-Claw 交互模式[/] (输入 /quit 退出)\n")
+    try:
+        agent_manager.bind_chat("cli", "cli_local", agent_id)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    cli_channel = CLIChannel(name="cli", agent_id=agent_id)
+    channel_manager.register_instance(cli_channel)
+    gateway.set_channel_manager(channel_manager)
 
     async def _chat_loop() -> None:
-        from mini_claw.agent.loop import run_agent_step
-        from mini_claw.agent.context import AgentContext
-        from mini_claw.tools.registry import ToolContext
-
-        provider = components["provider"]
-        registry = components["registry"]
-        agent_cfg = cfg.agents[0] if cfg.agents else None
-
-        history: list[dict] = []
-        system_prompt = (
-            agent_cfg.system_prompt if agent_cfg else "你是一个有用的助手。"
-        )
-
-        while True:
-            try:
-                user_input = console.input("[bold blue]你:[/] ")
-            except (EOFError, KeyboardInterrupt):
-                break
-            if user_input.strip() in ("/quit", "/exit", "/q"):
-                break
-            if not user_input.strip():
-                continue
-
-            history.append({"role": "user", "content": user_input})
-            with console.status("思考中..."):
-                response = await provider.chat(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        *history,
-                    ],
-                    tools=registry.schemas_for(
-                        agent_cfg.tools if agent_cfg else []
-                    ),
-                )
-            reply = response.text or "(无回复)"
-            history.append({"role": "assistant", "content": reply})
-            console.print(f"[bold green]助手:[/] {reply}\n")
+        await cli_channel.start()
 
     asyncio.run(_chat_loop())
 
@@ -269,17 +297,375 @@ def agents_list(
     ),
 ) -> None:
     """列出已配置的 Agent。"""
-    cfg = load_config(config_path)
+    manager = _agent_manager(config_path)
     table = Table(title="Agents")
     table.add_column("ID", style="cyan")
+    table.add_column("Name")
     table.add_column("Tools", style="green")
     table.add_column("路由 Chat IDs")
 
-    for agent in cfg.agents:
+    for agent in manager.list_agents():
         table.add_row(
             agent.id,
+            agent.name or agent.id,
             ", ".join(agent.tools),
             ", ".join(agent.route_chat_ids) or "(全部)",
+        )
+    console.print(table)
+
+
+@agents_app.command("add")
+def agents_add(
+    agent_id: str = typer.Argument(help="Agent ID"),
+    name: Optional[str] = typer.Option(None, "--name", help="Display name"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="Provider name"),
+    model: Optional[str] = typer.Option(None, "--model", help="Model override"),
+    tools: str = typer.Option(
+        "run_shell,read_file,write_file", "--tools", help="Comma-separated tools"
+    ),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Add a runtime agent."""
+    manager = _agent_manager(config_path)
+    cfg = load_config(config_path)
+    provider_cfg = None
+    if provider:
+        provider_cfg = ProviderConfig(
+            provider=provider,
+            api_key=cfg.provider.api_key,
+            model=model or cfg.provider.model,
+            base_url=cfg.provider.base_url,
+        )
+    agent_cfg = AgentConfig(
+        id=agent_id,
+        name=name,
+        provider=provider_cfg,
+        model=None if provider_cfg else model,
+        tools=[tool.strip() for tool in tools.split(",") if tool.strip()],
+    )
+    try:
+        manager.add_agent(agent_cfg)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Added agent[/] {agent_id}")
+
+
+@agents_app.command("remove")
+def agents_remove(
+    agent_id: str = typer.Argument(help="Agent ID"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Remove a runtime agent."""
+    manager = _agent_manager(config_path)
+    try:
+        removed = manager.remove_agent(agent_id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    if not removed:
+        console.print(f"[red]Agent not found:[/] {agent_id}")
+        raise typer.Exit(1)
+    console.print(f"[green]Removed agent[/] {agent_id}")
+
+
+@agents_app.command("bind")
+def agents_bind(
+    channel: str = typer.Argument(help="Channel name"),
+    chat_id: str = typer.Argument(help="Chat ID"),
+    agent_id: str = typer.Argument(help="Agent ID"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Bind a channel chat to an agent."""
+    manager = _agent_manager(config_path)
+    try:
+        manager.bind_chat(channel, chat_id, agent_id)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Bound[/] {channel}:{chat_id} -> {agent_id}")
+
+
+@agents_app.command("inspect")
+def agents_inspect(
+    agent_id: str = typer.Argument(help="Agent ID"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Inspect an agent and its bindings."""
+    manager = _agent_manager(config_path)
+    try:
+        agent = manager.get_agent(agent_id)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    provider_cfg = agent.provider
+    provider_name = provider_cfg.provider if provider_cfg else "(default)"
+    model = agent.model or (provider_cfg.model if provider_cfg else "(default)")
+    console.print(f"[bold]ID:[/] {agent.id}")
+    console.print(f"[bold]Name:[/] {agent.name or agent.id}")
+    console.print(f"[bold]Workspace:[/] {agent.workspace or f'workspaces/{agent.id}'}")
+    console.print(f"[bold]Provider:[/] {provider_name}")
+    console.print(f"[bold]Model:[/] {model}")
+    console.print(f"[bold]Tools:[/] {', '.join(agent.tools) or '(none)'}")
+
+    bindings = manager.bindings_for(agent_id)
+    if bindings:
+        table = Table(title="Bindings")
+        table.add_column("Channel")
+        table.add_column("Chat ID")
+        for row in bindings:
+            table.add_row(row["channel_name"], row["chat_id"])
+        console.print(table)
+    else:
+        console.print("[yellow]No runtime bindings.[/]")
+
+
+# ---------------------------------------------------------------------------
+# mini-claw skills
+# ---------------------------------------------------------------------------
+
+
+@skills_app.command("list")
+def skills_list(
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """List discovered skills."""
+    manager = _skill_manager(config_path)
+    table = Table(title="Skills")
+    table.add_column("Name", style="cyan")
+    table.add_column("Risk")
+    table.add_column("Agents")
+    table.add_column("Requires Tools")
+    table.add_column("Description")
+    for skill in manager.list_skills():
+        table.add_row(
+            skill.name,
+            skill.risk_level,
+            ", ".join(skill.agents) or "(all)",
+            ", ".join(skill.requires_tools) or "(none)",
+            skill.description,
+        )
+    console.print(table)
+
+
+@skills_app.command("enable")
+def skills_enable(
+    agent_id: str = typer.Argument(help="Agent ID"),
+    skill_name: str = typer.Argument(help="Skill name"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Enable a prompt skill for an agent."""
+    manager = _skill_manager(config_path)
+    try:
+        manager.enable_for_agent(agent_id, skill_name)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Enabled skill[/] {skill_name} -> {agent_id}")
+
+
+@skills_app.command("disable")
+def skills_disable(
+    agent_id: str = typer.Argument(help="Agent ID"),
+    skill_name: str = typer.Argument(help="Skill name"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Disable a prompt skill for an agent."""
+    manager = _skill_manager(config_path)
+    try:
+        manager.disable_for_agent(agent_id, skill_name)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Disabled skill[/] {skill_name} -> {agent_id}")
+
+
+@skills_app.command("inspect")
+def skills_inspect(
+    skill_name: str = typer.Argument(help="Skill name"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Inspect a skill manifest and bindings."""
+    manager = _skill_manager(config_path)
+    agent_manager = _agent_manager(config_path)
+    try:
+        skill = manager.get_skill(skill_name)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]Name:[/] {skill.name}")
+    console.print(f"[bold]Description:[/] {skill.description}")
+    console.print(f"[bold]Trigger:[/] {skill.trigger}")
+    console.print(f"[bold]Risk:[/] {skill.risk_level}")
+    console.print(f"[bold]Agents:[/] {', '.join(skill.agents) or '(all)'}")
+    console.print(f"[bold]Requires tools:[/] {', '.join(skill.requires_tools) or '(none)'}")
+    fragment = (skill.prompt_fragment or "").strip()
+    console.print(f"[bold]Prompt preview:[/] {fragment[:300] or '(empty)'}")
+
+    bindings = manager.bindings_for_skill(skill_name)
+    if bindings:
+        table = Table(title="Bindings")
+        table.add_column("Agent")
+        table.add_column("Enabled")
+        for row in bindings:
+            table.add_row(row["agent_id"], "yes" if row["enabled"] else "no")
+        console.print(table)
+
+    diff_table = Table(title="Requires Tools vs Agent Tools")
+    diff_table.add_column("Agent")
+    diff_table.add_column("Missing")
+    for agent in agent_manager.list_agents():
+        missing = sorted(set(skill.requires_tools) - set(agent.tools))
+        diff_table.add_row(agent.id, ", ".join(missing) or "(none)")
+    console.print(diff_table)
+
+
+# ---------------------------------------------------------------------------
+# mini-claw plugins
+# ---------------------------------------------------------------------------
+
+
+@plugins_app.command("list")
+def plugins_list(
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """List installed plugins."""
+    manager = _plugin_manager(config_path)
+    table = Table(title="Plugins")
+    table.add_column("Name", style="cyan")
+    table.add_column("Enabled")
+    table.add_column("Hash")
+    table.add_column("Error")
+    for row in manager.list_plugins():
+        table.add_row(
+            row["name"],
+            "yes" if row["enabled"] else "no",
+            (row.get("manifest_hash") or "")[:12],
+            row.get("error_msg") or "",
+        )
+    console.print(table)
+
+
+@plugins_app.command("install")
+def plugins_install(
+    path: Path = typer.Argument(help="Local plugin directory"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Install a local plugin directory without enabling it."""
+    manager = _plugin_manager(config_path)
+    try:
+        manifest = manager.install(path)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Installed plugin disabled by default:[/] {manifest['name']}")
+
+
+@plugins_app.command("enable")
+def plugins_enable(
+    name: str = typer.Argument(help="Plugin name"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm manifest permissions"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Enable an installed plugin after manifest confirmation."""
+    manager = _plugin_manager(config_path)
+    result = manager.enable(name, confirmed=yes)
+    manifest = result["manifest"]
+    console.print("[bold]Plugin manifest[/]")
+    console.print_json(data=manifest)
+    if result["requires_confirmation"]:
+        if not typer.confirm("Enable this plugin?", default=False):
+            console.print("[yellow]Cancelled.[/]")
+            raise typer.Exit()
+        manager.enable(name, confirmed=True)
+    console.print(f"[green]Enabled plugin[/] {name}")
+
+
+@plugins_app.command("disable")
+def plugins_disable(
+    name: str = typer.Argument(help="Plugin name"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Disable a plugin. Registered tools disappear after Gateway restart."""
+    manager = _plugin_manager(config_path)
+    if not manager.disable(name):
+        console.print(f"[red]Plugin not found:[/] {name}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]Disabled plugin[/] {name}. Restart Gateway to remove already registered tools."
+    )
+
+
+@plugins_app.command("inspect")
+def plugins_inspect(
+    name: str = typer.Argument(help="Plugin name"),
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Inspect a plugin manifest, hash, and static audit result."""
+    manager = _plugin_manager(config_path)
+    try:
+        info = manager.inspect(name)
+    except Exception as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    console.print("[bold]Manifest[/]")
+    console.print_json(data=info["manifest"])
+    console.print(f"[bold]Hash:[/] {info['hash']}")
+    console.print(f"[bold]Static issues:[/] {info['static_issues'] or '(none)'}")
+    if info["row"]:
+        console.print("[bold]Database row[/]")
+        console.print_json(data=info["row"])
+
+
+@plugins_app.command("audit")
+def plugins_audit(
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="配置文件路径"
+    ),
+) -> None:
+    """Recompute plugin hashes and report integrity drift."""
+    manager = _plugin_manager(config_path)
+    table = Table(title="Plugin Audit")
+    table.add_column("Name", style="cyan")
+    table.add_column("Matches")
+    table.add_column("Declared")
+    table.add_column("Actual")
+    table.add_column("Static Issues")
+    for row in manager.audit():
+        table.add_row(
+            row["name"],
+            "yes" if row["matches"] else "no",
+            (row.get("declared") or "")[:12],
+            row["actual"][:12],
+            "; ".join(row["static_issues"]) or "(none)",
         )
     console.print(table)
 

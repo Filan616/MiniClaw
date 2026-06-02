@@ -4,24 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
-from typing import Any, Protocol
 
 from mini_claw.channels.base import Channel, InboundMessage
-
-
-class Gateway(Protocol):
-    """Protocol for the gateway that processes inbound messages."""
-
-    async def handle_message(self, msg: InboundMessage) -> None: ...
 
 
 class CLIChannel(Channel):
     """Local testing channel that uses stdin/stdout."""
 
-    def __init__(self) -> None:
+    channel_type = "cli"
+
+    def __init__(self, name: str = "cli", agent_id: str = "default") -> None:
+        super().__init__(name=name)
         self._stream_buffer = ""
+        self._running = False
+        self._agent_id = agent_id
 
     async def send(self, chat_id: str, text: str) -> None:
         """Print the message to stdout."""
@@ -52,15 +51,25 @@ class CLIChannel(Channel):
         print(f"  Args: {args_display}")
         print(f"  Auto-approving {approval_id} (CLI testing mode)")
 
-    async def interactive_loop(self, gateway: Any) -> None:
+    async def start(self) -> None:
+        await self.interactive_loop()
+
+    async def stop(self) -> None:
+        self._running = False
+
+    async def interactive_loop(self) -> None:
         """Read from stdin and send messages to the gateway."""
         chat_id = "cli_local"
-        sender_id = "cli_user"
+        try:
+            sender_id = os.getlogin()
+        except OSError:
+            sender_id = "cli_user"
         print("MiniClaw CLI (type 'quit' to exit)")
         print("-" * 40)
 
         loop = asyncio.get_event_loop()
-        while True:
+        self._running = True
+        while self._running:
             try:
                 text = await loop.run_in_executor(
                     None, lambda: input("\nyou> ")
@@ -77,10 +86,11 @@ class CLIChannel(Channel):
                 continue
 
             msg = InboundMessage(
+                channel_name=self.name,
                 chat_id=chat_id,
                 sender_id=sender_id,
                 text=text.strip(),
                 event_id=uuid.uuid4().hex,
                 timestamp=int(time.time()),
             )
-            await gateway.handle_message(msg)
+            await self._dispatch_message(msg)

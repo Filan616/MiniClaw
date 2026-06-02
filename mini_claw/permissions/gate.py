@@ -133,6 +133,7 @@ class PermissionGate:
         agent_id: str,
         tool_call: dict,
         ttl: int = 300,
+        approval_type: str = "tool",
     ) -> str:
         """Create a pending approval record and return its ID.
 
@@ -155,6 +156,7 @@ class PermissionGate:
             tool_name=tool_call.get("tool", ""),
             tool_args=tool_call.get("args", {}),
             expires_at=expires_at,
+            approval_type=approval_type,
         )
         return approval_id
 

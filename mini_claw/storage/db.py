@@ -43,8 +43,66 @@ class Database:
 
     def init_tables(self) -> None:
         """Create all tables and indexes if they do not exist."""
+        self._pre_migrate_processed_events()
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate_schema()
+
+    def _pre_migrate_processed_events(self) -> None:
+        """Upgrade old processed_events before schema indexes are created."""
+        table = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='processed_events'"
+        ).fetchone()
+        if table is None:
+            return
+
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(processed_events)").fetchall()
+        }
+        if "started_at" in columns and "status" in columns and "heartbeat_at" in columns:
+            return
+
+        rows = self._conn.execute("SELECT * FROM processed_events").fetchall()
+        self._conn.executescript(
+            """
+            ALTER TABLE processed_events RENAME TO processed_events_old;
+            CREATE TABLE processed_events (
+                event_id TEXT PRIMARY KEY,
+                channel_name TEXT DEFAULT 'feishu',
+                chat_id TEXT,
+                status TEXT NOT NULL,
+                run_id TEXT,
+                started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                error TEXT,
+                attempt_count INTEGER DEFAULT 1
+            );
+            """
+        )
+        now = int(time.time())
+        for row in rows:
+            data = dict(row)
+            ts = data.get("processed_at") or data.get("started_at") or now
+            self._conn.execute(
+                "INSERT OR IGNORE INTO processed_events "
+                "(event_id, channel_name, chat_id, status, run_id, started_at, heartbeat_at, finished_at, error, attempt_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    data.get("event_id"),
+                    data.get("channel_name") or "feishu",
+                    data.get("chat_id"),
+                    data.get("status") or "handled",
+                    data.get("run_id"),
+                    ts,
+                    data.get("heartbeat_at") or ts,
+                    data.get("finished_at") or ts,
+                    data.get("error"),
+                    data.get("attempt_count") or 1,
+                ),
+            )
+        self._conn.execute("DROP TABLE processed_events_old")
+        self._conn.commit()
 
     def _migrate_schema(self) -> None:
         """Apply schema migrations for existing databases."""
@@ -74,6 +132,7 @@ class Database:
                     -- Create new table with full schema
                     CREATE TABLE processed_events (
                         event_id TEXT PRIMARY KEY,
+                        channel_name TEXT DEFAULT 'feishu',
                         chat_id TEXT,
                         status TEXT NOT NULL,
                         run_id TEXT,
@@ -89,8 +148,8 @@ class Database:
                     CREATE INDEX idx_processed_events_heartbeat ON processed_events(heartbeat_at);
 
                     -- Migrate old data
-                    INSERT INTO processed_events (event_id, chat_id, status, started_at, heartbeat_at, finished_at)
-                    SELECT event_id, NULL, 'handled', processed_at, processed_at, processed_at
+                    INSERT INTO processed_events (event_id, channel_name, chat_id, status, started_at, heartbeat_at, finished_at)
+                    SELECT event_id, 'feishu', NULL, 'handled', processed_at, processed_at, processed_at
                     FROM processed_events_old;
 
                     -- Drop old table
@@ -125,6 +184,30 @@ class Database:
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # Migration 5: Phase 2 channel/session dimensions.
+        channel_migrations = [
+            "ALTER TABLE sessions ADD COLUMN channel_name TEXT DEFAULT 'feishu'",
+            "ALTER TABLE sessions ADD COLUMN thread_id TEXT DEFAULT NULL",
+            "ALTER TABLE processed_events ADD COLUMN channel_name TEXT DEFAULT 'feishu'",
+        ]
+        for migration in channel_migrations:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+        # Migration 6: Workflow approvals and workflow observability.
+        approval_migrations = [
+            "ALTER TABLE pending_approvals ADD COLUMN approval_type TEXT DEFAULT 'tool'",
+        ]
+        for migration in approval_migrations:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -216,6 +299,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id     TEXT NOT NULL,
     created_at   INTEGER,
     updated_at   INTEGER,
+    channel_name TEXT DEFAULT 'feishu',
+    thread_id    TEXT DEFAULT NULL,
     sandbox_mode_override TEXT  -- "safe", "bypass", or NULL (use config default)
 );
 
@@ -237,6 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id, id);
 -- Event deduplication with crash recovery support
 CREATE TABLE IF NOT EXISTS processed_events (
     event_id TEXT PRIMARY KEY,
+    channel_name TEXT DEFAULT 'feishu',
     chat_id TEXT,
     status TEXT NOT NULL,        -- "processing" / "handled" / "failed"
     run_id TEXT,
@@ -304,6 +390,46 @@ CREATE TABLE IF NOT EXISTS user_memory (
     value        TEXT,
     PRIMARY KEY (agent_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS agents (
+    id           TEXT PRIMARY KEY,
+    name         TEXT,
+    config_json  TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    enabled      INTEGER DEFAULT 1,
+    created_at   INTEGER,
+    updated_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS channel_bindings (
+    channel_name TEXT NOT NULL,
+    chat_id      TEXT NOT NULL,
+    agent_id     TEXT NOT NULL,
+    created_at   INTEGER,
+    PRIMARY KEY (channel_name, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS skill_bindings (
+    agent_id     TEXT NOT NULL,
+    skill_name   TEXT NOT NULL,
+    enabled      INTEGER DEFAULT 1,
+    created_at   INTEGER,
+    PRIMARY KEY (agent_id, skill_name)
+);
+
+CREATE TABLE IF NOT EXISTS plugins (
+    name                 TEXT PRIMARY KEY,
+    version              TEXT,
+    enabled              INTEGER DEFAULT 0,
+    manifest_json        TEXT,
+    manifest_hash        TEXT,
+    declared_permissions TEXT,
+    error_msg            TEXT,
+    last_loaded_at       INTEGER,
+    installed_at         INTEGER,
+    enabled_at           INTEGER
+);
+
 -- Observability group
 CREATE TABLE IF NOT EXISTS agent_runs (
     id                  TEXT PRIMARY KEY,
@@ -356,6 +482,7 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     tool_name    TEXT NOT NULL,
     tool_args    TEXT NOT NULL,
     status       TEXT NOT NULL,
+    approval_type TEXT DEFAULT 'tool',
     created_at   INTEGER,
     expires_at   INTEGER
 );
@@ -372,5 +499,49 @@ CREATE TABLE IF NOT EXISTS artifacts (
     id           TEXT PRIMARY KEY,
     content      TEXT NOT NULL,
     created_at   INTEGER
+);
+
+-- Workflow group
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    workflow_id     TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    spec_json       TEXT NOT NULL,
+    approval_id     TEXT,
+    approval_reason TEXT,
+    approved_at     INTEGER,
+    rejected_at     INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    error           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_chat_agent ON workflow_runs(chat_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status);
+
+CREATE TABLE IF NOT EXISTS workflow_nodes (
+    workflow_id  TEXT NOT NULL,
+    node_id      TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    agent_run_id TEXT,
+    result_json  TEXT,
+    started_at   INTEGER,
+    finished_at  INTEGER,
+    error        TEXT,
+    PRIMARY KEY (workflow_id, node_id),
+    FOREIGN KEY (workflow_id) REFERENCES workflow_runs(workflow_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_node_prompts (
+    workflow_id        TEXT NOT NULL,
+    node_id            TEXT NOT NULL,
+    system_prompt      TEXT NOT NULL,
+    user_prompt        TEXT NOT NULL,
+    output_schema_json TEXT,
+    compiled_at        INTEGER NOT NULL,
+    redacted           INTEGER DEFAULT 0,
+    PRIMARY KEY (workflow_id, node_id),
+    FOREIGN KEY (workflow_id) REFERENCES workflow_runs(workflow_id)
 );
 """

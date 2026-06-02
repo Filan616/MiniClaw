@@ -74,6 +74,29 @@ def _ctx_to_dict(ctx: AgentContext) -> dict[str, Any]:
     }
 
 
+def _messages_for_provider(run: AgentRun, ctx: AgentContext) -> list[dict[str, Any]]:
+    """Build provider messages with base and skill system prompt context."""
+    prompt_parts: list[str] = []
+    if ctx.system_prompt:
+        prompt_parts.append(ctx.system_prompt.strip())
+
+    if ctx.skill_manager is not None:
+        fragment = ctx.skill_manager.compose_prompt_fragment(
+            ctx.agent_id,
+            run.allowed_tools,
+        )
+        if fragment:
+            prompt_parts.append(fragment)
+
+    if not prompt_parts:
+        return run.messages
+
+    system_message = {"role": "system", "content": "\n\n".join(prompt_parts)}
+    if run.messages and run.messages[0].get("role") == "system":
+        return [system_message, *run.messages[1:]]
+    return [system_message, *run.messages]
+
+
 async def _process_single_tool_call(
     tc: Any,
     run: AgentRun,
@@ -265,7 +288,7 @@ async def run_agent_step(
         run.iterations += 1
 
         response = await provider.chat(
-            messages=run.messages,
+            messages=_messages_for_provider(run, ctx),
             tools=tool_schemas if tool_schemas else None,
             stream=True,
             stream_callback=stream_callback,

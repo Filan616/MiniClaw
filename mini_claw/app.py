@@ -47,12 +47,16 @@ def create_components(
     Returns a dict with keys: provider, registry, permission_gate,
     storage, skills, config, workspace_manager, result_processor, gateway.
     """
+    from mini_claw.agent.manager import AgentManager
     from mini_claw.agent.workspace import WorkspaceManager
+    from mini_claw.channels.manager import ChannelManager
     from mini_claw.gateway.router import Gateway
     from mini_claw.permissions.approval_store import ApprovalStore
     from mini_claw.permissions.gate import PermissionGate
     from mini_claw.permissions.policy import PermissionPolicy
-    from mini_claw.providers import get_provider
+    from mini_claw.plugins.manager import PluginManager
+    from mini_claw.providers.manager import ProviderManager
+    from mini_claw.skills.manager import SkillManager
     from mini_claw.skills._loader import load_skills, register_skill_tools
     from mini_claw.storage import Database
     from mini_claw.tools.builtin import BUILTIN_TOOLS
@@ -65,8 +69,8 @@ def create_components(
     db_path = data_dir / "mini_claw.db"
     storage = Database(db_path)
 
-    # Provider
-    provider = get_provider(config.provider)
+    # Provider manager (Phase 1.3)
+    provider_manager = ProviderManager(config)
 
     # Tool registry
     registry = ToolRegistry()
@@ -77,12 +81,12 @@ def create_components(
     skills_dir = Path.cwd() / "skills"
     skills = load_skills(skills_dir)
     register_skill_tools(registry, skills)
+    skill_manager = SkillManager(storage, skills_dir, registry)
 
     # Permissions (Phase 0.2: ApprovalStore for persistent approvals/grants)
     approval_store = ApprovalStore(storage)
     policy = PermissionPolicy(config.permissions)
     permission_gate = PermissionGate(policy, approval_store)
-
     # Expire old pending approvals on startup
     expired = approval_store.expire_pending(86400)
     if expired:
@@ -92,28 +96,53 @@ def create_components(
     workspace_manager = WorkspaceManager(base_dir=data_dir / "workspaces")
     workspace_manager.load_workspaces(config.agents)
 
+    # Agent manager (Phase 1.2) persists config agents and runtime bindings.
+    agent_manager = AgentManager(storage, config, workspace_manager)
+    default_agent = agent_manager.resolve_for_chat("feishu", "")
+    provider = provider_manager.get_provider_for_agent(default_agent)
+
     # Result processor for tool outputs
     result_processor = ToolResultProcessor()
+    channel_manager = ChannelManager(config)
+    plugin_manager = PluginManager(
+        plugins_dir=data_dir / "plugins",
+        registry=registry,
+        channel_manager=channel_manager,
+        provider_manager=provider_manager,
+        storage=storage,
+    )
+    plugin_manager.load_enabled()
 
     # Gateway — central message orchestrator
     gateway = Gateway(
         config=config,
         storage=storage,
-        provider=provider,
+        provider_manager=provider_manager,
         registry=registry,
         permission_gate=permission_gate,
         result_processor=result_processor,
         workspace_manager=workspace_manager,
+        agent_manager=agent_manager,
+        channel_manager=channel_manager,
+        skill_manager=skill_manager,
     )
+    channel_manager.set_gateway(gateway)
+    channel_manager.load_enabled()
+    gateway.set_channel_manager(channel_manager)
 
     return {
         "provider": provider,
+        "provider_manager": provider_manager,
         "registry": registry,
         "permission_gate": permission_gate,
         "storage": storage,
         "skills": skills,
+        "skill_manager": skill_manager,
         "config": config,
         "workspace_manager": workspace_manager,
+        "agent_manager": agent_manager,
+        "channel_manager": channel_manager,
+        "plugin_manager": plugin_manager,
         "result_processor": result_processor,
         "gateway": gateway,
     }
@@ -126,36 +155,20 @@ def create_app(config: AppConfig, config_path: Path | None = None) -> FastAPI:
     in a background thread when enabled, with on_message / on_card_action
     routed to the Gateway.
     """
-    from mini_claw.channels.feishu import FeishuChannel
-
     components = create_components(config, config_path=config_path)
-    gateway = components["gateway"]
     registry = components["registry"]
-
-    feishu: FeishuChannel | None = None
-    if config.channels_feishu.enabled:
-        feishu = FeishuChannel(
-            app_id=config.channels_feishu.app_id,
-            app_secret=config.channels_feishu.app_secret,
-        )
-        # Wire the channel into the gateway and the gateway into the channel.
-        gateway.set_channel(feishu)
-        feishu.on_message = gateway.handle_message
-        feishu.on_card_action = gateway.handle_card_action
-        components["feishu_channel"] = feishu
+    channel_manager = components["channel_manager"]
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         # Startup: recover stale processing events from crashes
         _recover_stale_events(components["storage"])
 
-        if feishu is not None:
-            await feishu.start()
+        await channel_manager.start_all()
         try:
             yield
         finally:
-            if feishu is not None:
-                await feishu.stop()
+            await channel_manager.stop_all()
 
     app = FastAPI(
         title="Mini-Claw",
@@ -176,6 +189,6 @@ def create_app(config: AppConfig, config_path: Path | None = None) -> FastAPI:
         "Mini-Claw 应用已创建 (tools=%d, skills=%d, feishu=%s)",
         len(registry.list_tools()),
         len(components["skills"]),
-        "on" if feishu is not None else "off",
+        "on" if channel_manager.has_channel("feishu") else "off",
     )
     return app

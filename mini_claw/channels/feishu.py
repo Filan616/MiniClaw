@@ -41,12 +41,16 @@ SEND_MSG_URL = f"{FEISHU_BASE_URL}/im/v1/messages"
 class FeishuChannel(Channel):
     """Feishu messaging channel: WS for receive, REST for send."""
 
+    channel_type = "feishu"
+
     def __init__(
         self,
         app_id: str,
         app_secret: str,
+        name: str = "feishu",
         log_level: lark.LogLevel = lark.LogLevel.INFO,
     ) -> None:
+        super().__init__(name=name)
         self.app_id = app_id
         self.app_secret = app_secret
         self._log_level = log_level
@@ -339,6 +343,7 @@ class FeishuChannel(Channel):
                 event_id = event.header.event_id or ""
 
             msg = InboundMessage(
+                channel_name=self.name,
                 chat_id=msg_obj.chat_id or "",
                 sender_id=sender_open_id,
                 text=text,

@@ -4,41 +4,52 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from mini_claw.tools.registry import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-_FRONTMATTER_RE = re.compile(
-    r"^---\s*\n(.*?)\n---", re.DOTALL
-)
-
 
 @dataclass(slots=True)
 class SkillInfo:
-    """Metadata and tools for a loaded skill."""
+    """Metadata and legacy tools for a loaded skill.
+
+    Security boundary:
+    - Skills cannot elevate permissions. They only provide prompt text.
+    - ``requires_tools`` is an audit hint only and never mutates an agent's
+      tool allowlist.
+    - SkillManager must not call ``register_skill_tools``. Legacy tool
+      registration only happens during app bootstrap for backwards
+      compatibility with existing skills such as ``daily_report``.
+    """
 
     name: str
     description: str
     trigger: str
+    prompt_fragment: str | None = None
+    agents: list[str] = field(default_factory=list)
+    max_chars: int = 8000
+    risk_level: str = "low"
+    requires_tools: list[str] = field(default_factory=list)
     tools: list[Tool] = field(default_factory=list)
 
 
-def _parse_frontmatter(text: str) -> dict[str, str]:
-    """Parse YAML-like frontmatter from SKILL.md content."""
-    match = _FRONTMATTER_RE.match(text)
-    if not match:
-        return {}
-    result: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" in line:
-            key, _, value = line.partition(":")
-            result[key.strip()] = value.strip()
-    return result
+def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """Parse YAML frontmatter and return ``(metadata, body)``."""
+    if not text.startswith("---"):
+        return {}, text.strip()
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text.strip()
+    meta = yaml.safe_load(parts[1]) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return meta, parts[2].strip()
 
 
 def _load_tools_from_module(tools_py: Path) -> list[Tool]:
@@ -86,7 +97,7 @@ def load_skills(skills_dir: Path) -> list[SkillInfo]:
             continue
 
         text = skill_md.read_text(encoding="utf-8")
-        meta = _parse_frontmatter(text)
+        meta, body = _split_frontmatter(text)
         name = meta.get("name", child.name)
         description = meta.get("description", "")
         trigger = meta.get("trigger", "")
@@ -101,6 +112,11 @@ def load_skills(skills_dir: Path) -> list[SkillInfo]:
             name=name,
             description=description,
             trigger=trigger,
+            prompt_fragment=body or None,
+            agents=list(meta.get("agents") or []),
+            max_chars=int(meta.get("max_chars") or 8000),
+            risk_level=meta.get("risk_level", "low"),
+            requires_tools=list(meta.get("requires_tools") or []),
             tools=tools,
         )
         loaded.append(skill)

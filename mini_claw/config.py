@@ -54,6 +54,13 @@ class FeishuChannelConfig(BaseModel):
     app_secret: str = ""
 
 
+class ChannelConfig(BaseModel):
+    name: str
+    type: str
+    enabled: bool = True
+    options: dict = Field(default_factory=dict)
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
@@ -138,21 +145,99 @@ class PermissionsConfig(BaseModel):
     )
 
 
+class WorkflowTemplateConfig(BaseModel):
+    enabled: bool = True
+
+
+class WorkflowRiskPolicyConfig(BaseModel):
+    write_file: str = "approval"
+    run_shell: str = "approval"
+    dynamic_workflow: str = "approval"
+
+
+class WorkflowTemplatesConfig(BaseModel):
+    debug_fix: WorkflowTemplateConfig = Field(default_factory=WorkflowTemplateConfig)
+    code_review: WorkflowTemplateConfig = Field(default_factory=WorkflowTemplateConfig)
+    migration: WorkflowTemplateConfig = Field(default_factory=WorkflowTemplateConfig)
+
+
+class WorkflowConfig(BaseModel):
+    enabled: bool = False
+    auto_detect: bool = False
+    require_approval: bool = True
+    max_nodes_per_workflow: int = 8
+    max_parallel_nodes: int = 3
+    max_total_agent_runs: int = 12
+    allow_dynamic: bool = False
+    allow_llm_generated_script: bool = False
+    max_prompt_chars: int = 12000
+    templates: WorkflowTemplatesConfig = Field(default_factory=WorkflowTemplatesConfig)
+    risk_policy: WorkflowRiskPolicyConfig = Field(default_factory=WorkflowRiskPolicyConfig)
+
+
 class AgentConfig(BaseModel):
     id: str = "default"
+    name: str | None = None
     system_prompt: str = "你是一个高效的个人助手，能调用工具帮用户完成各种任务。"
+    workspace: str | None = None
+    provider: ProviderConfig | None = None
+    model: str | None = None
+    enabled: bool = True
     tools: list[str] = Field(
         default_factory=lambda: ["run_shell", "read_file", "write_file"]
     )
+    skills: list[str] = Field(default_factory=list)
     route_chat_ids: list[str] = Field(default_factory=list)
 
 
 class AppConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     channels_feishu: FeishuChannelConfig = Field(default_factory=FeishuChannelConfig)
+    channels: list[ChannelConfig] = Field(default_factory=list)
     server: ServerConfig = Field(default_factory=ServerConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
+    workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
+    agents_defaults: AgentConfig | None = None
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
+
+
+def _merge_agent_defaults(data: dict) -> dict:
+    defaults = data.get("agents_defaults")
+    agents = data.get("agents")
+    if not defaults or not isinstance(defaults, dict) or not isinstance(agents, list):
+        return data
+
+    merged_agents = []
+    for agent in agents:
+        if isinstance(agent, dict):
+            merged_agents.append({**defaults, **agent})
+        else:
+            merged_agents.append(agent)
+
+    data = dict(data)
+    data["agents"] = merged_agents
+    return data
+
+
+def _normalize_channels(data: dict) -> dict:
+    data = dict(data)
+    if data.get("channels"):
+        return data
+
+    feishu = data.get("channels_feishu")
+    if isinstance(feishu, dict):
+        data["channels"] = [
+            {
+                "name": "feishu",
+                "type": "feishu",
+                "enabled": feishu.get("enabled", False),
+                "options": {
+                    "app_id": feishu.get("app_id", ""),
+                    "app_secret": feishu.get("app_secret", ""),
+                },
+            }
+        ]
+    return data
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -163,5 +248,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         if "channels" in data and isinstance(data["channels"], dict) and "feishu" in data["channels"]:
             data["channels_feishu"] = data["channels"]["feishu"]
             del data["channels"]
+        data = _normalize_channels(data)
+        data = _merge_agent_defaults(data)
         return AppConfig(**data)
     return AppConfig()

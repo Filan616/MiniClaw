@@ -26,7 +26,9 @@ class SessionManager:
     def __init__(self, storage: Database) -> None:
         self._storage = storage
 
-    def get_or_create(self, chat_id: str, agent_id: str) -> dict[str, Any]:
+    def get_or_create(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> dict[str, Any]:
         """Get an existing session or create a new one.
 
         Returns a dict with session metadata.
@@ -39,27 +41,33 @@ class SessionManager:
             # Update last activity
             now = int(time.time())
             self._storage.execute(
-                "UPDATE sessions SET updated_at = ? WHERE chat_id = ? AND agent_id = ?",
-                (now, chat_id, agent_id),
+                "UPDATE sessions SET updated_at = ?, channel_name = ? "
+                "WHERE chat_id = ? AND agent_id = ?",
+                (now, channel_name, chat_id, agent_id),
             )
             row["updated_at"] = now
+            row["channel_name"] = channel_name
             return row
 
         now = int(time.time())
         self._storage.execute(
-            "INSERT INTO sessions (chat_id, agent_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, agent_id, now, now),
+            "INSERT INTO sessions (chat_id, agent_id, channel_name, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, agent_id, channel_name, now, now),
         )
         return {
             "chat_id": chat_id,
             "agent_id": agent_id,
+            "channel_name": channel_name,
+            "thread_id": None,
             "created_at": now,
             "updated_at": now,
             "sandbox_mode_override": None,
         }
 
-    def set_sandbox_mode(self, chat_id: str, agent_id: str, mode: str) -> None:
+    def set_sandbox_mode(
+        self, chat_id: str, agent_id: str, mode: str, channel_name: str = "feishu"
+    ) -> None:
         """Set sandbox_mode_override for a session ("safe", "bypass", or None).
 
         Also clears any previously-set TTL state (``sandbox_mode_expires_at``,
@@ -71,12 +79,15 @@ class SessionManager:
             "sandbox_mode_expires_at = NULL, "
             "sandbox_mode_single_use = 0, "
             "sandbox_mode_persistent = 0, "
+            "channel_name = ?, "
             "updated_at = ? "
             "WHERE chat_id = ? AND agent_id = ?",
-            (mode, int(time.time()), chat_id, agent_id),
+            (mode, channel_name, int(time.time()), chat_id, agent_id),
         )
 
-    def get_sandbox_mode(self, chat_id: str, agent_id: str) -> str | None:
+    def get_sandbox_mode(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> str | None:
         """Get sandbox_mode_override for a session, or None if not set."""
         row = self._storage.fetchone(
             "SELECT sandbox_mode_override FROM sessions WHERE chat_id = ? AND agent_id = ?",
@@ -90,6 +101,7 @@ class SessionManager:
         agent_id: str,
         mode: str,
         expires_at: int | None,
+        channel_name: str = "feishu",
     ) -> None:
         """Set sandbox mode together with its expiry timestamp.
 
@@ -103,12 +115,14 @@ class SessionManager:
         """
         self._storage.execute(
             "UPDATE sessions SET sandbox_mode_override = ?, "
-            "sandbox_mode_expires_at = ?, updated_at = ? "
+            "sandbox_mode_expires_at = ?, channel_name = ?, updated_at = ? "
             "WHERE chat_id = ? AND agent_id = ?",
-            (mode, expires_at, int(time.time()), chat_id, agent_id),
+            (mode, expires_at, channel_name, int(time.time()), chat_id, agent_id),
         )
 
-    def clear_single_use_bypass(self, chat_id: str, agent_id: str) -> None:
+    def clear_single_use_bypass(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> None:
         """Clear single-use bypass after consumption.
 
         Reads the current sandbox-mode override row and, if it represents a
@@ -135,7 +149,9 @@ class SessionManager:
                 (int(time.time()), chat_id, agent_id),
             )
 
-    def get_effective_sandbox_mode(self, chat_id: str, agent_id: str) -> str:
+    def get_effective_sandbox_mode(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> str:
         """Return the effective sandbox mode, applying TTL semantics.
 
         Rules:
@@ -188,7 +204,7 @@ class SessionManager:
         return "safe"
 
     def get_history(
-        self, chat_id: str, agent_id: str
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
     ) -> list[dict[str, Any]]:
         """Get recent messages for context window construction.
 
@@ -248,6 +264,7 @@ class SessionManager:
         role: str,
         content: str | None,
         run_id: str | None = None,
+        channel_name: str = "feishu",
     ) -> None:
         """Persist a message to the history store."""
         now = int(time.time())
@@ -257,7 +274,9 @@ class SessionManager:
             (chat_id, agent_id, run_id, role, content, now),
         )
 
-    def count_messages(self, chat_id: str, agent_id: str) -> int:
+    def count_messages(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> int:
         """Return the number of non-compacted messages for ``(chat_id, agent_id)``.
 
         Compaction summaries are still counted because they remain
@@ -283,6 +302,7 @@ class SessionManager:
         chat_id: str,
         agent_id: str,
         keep_recent: int = DEFAULT_KEEP_RECENT,
+        channel_name: str = "feishu",
     ) -> int:
         """Compact older messages into a system summary backed by TaskState.
 

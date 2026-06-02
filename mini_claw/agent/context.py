@@ -19,3 +19,5 @@ class AgentContext:
     sandbox_mode: str = "safe"
     audit_logger: Any = None  # SecurityAuditLogger instance
     chain_detector: Any = None  # ChainDetector instance
+    system_prompt: str | None = None
+    skill_manager: Any = None

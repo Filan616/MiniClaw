@@ -1,0 +1,11 @@
+name: example_echo
+version: 0.1.0
+description: Example plugin that registers an L0 echo tool.
+author: MiniClaw
+type: tool
+entry: plugin
+permissions:
+  - L0
+enabled: false
+integrity:
+  sha256: 68803ec3658746a528ed6f7ff307e75262889aa2df962c76abc3d032df32d60b

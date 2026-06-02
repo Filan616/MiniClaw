@@ -63,6 +63,8 @@ class PluginManager:
         self._storage = storage
         self._audit_logger = audit_logger or SecurityAuditLogger(storage)
         self._integrity_mode = integrity_mode
+        # Phase B.5: Track tools registered by each plugin for hot-removal
+        self._plugin_tools: dict[str, list[str]] = {}
         self._plugins_dir.mkdir(parents=True, exist_ok=True)
 
     def discover(self) -> list[dict[str, Any]]:
@@ -179,9 +181,34 @@ class PluginManager:
         }
 
     def disable(self, name: str) -> bool:
+        """Disable a plugin and hot-remove its tools (Phase B.5).
+
+        Removes tools from the registry immediately. New runs will not see
+        the disabled plugin's tools. Runs in-flight that have already obtained
+        a tool handler reference complete normally.
+
+        Returns True if the plugin row was updated.
+        """
         cur = self._storage.execute(
             "UPDATE plugins SET enabled=0 WHERE name=?", (name,)
         )
+        # Hot-remove registered tools
+        registered = self._plugin_tools.pop(name, [])
+        for tool_name in registered:
+            try:
+                if hasattr(self._registry, "unregister"):
+                    self._registry.unregister(tool_name)
+            except Exception:
+                # Best-effort: log but don't crash disable
+                pass
+        # Audit
+        try:
+            self._audit_logger.log_security_event(
+                "plugin_disabled",
+                {"name": name, "tools_removed": registered},
+            )
+        except Exception:
+            pass
         return cur.rowcount > 0
 
     def load(self, name: str) -> bool:
@@ -227,7 +254,7 @@ class PluginManager:
                 workspace_dir=plugin_dir,
                 storage=self._storage,
             )
-            self._call_registers(module, ctx)
+            self._call_registers(module, ctx, plugin_name=name)
             self._upsert_plugin_row(
                 manifest,
                 enabled=1 if manifest.get("enabled") else self._enabled_from_db(name),
@@ -376,9 +403,24 @@ class PluginManager:
         spec.loader.exec_module(module)  # type: ignore[union-attr]
         return module
 
-    def _call_registers(self, module: Any, ctx: PluginContext) -> None:
+    def _call_registers(self, module: Any, ctx: PluginContext, plugin_name: str = "") -> None:
+        # Phase B.5: Wrap registry to track which tools this plugin registers
+        tools_registered: list[str] = []
+        registry = self._registry
+
+        class _TrackingRegistry:
+            def register(self_inner, tool: Any) -> None:
+                registry.register(tool)
+                if hasattr(tool, "name"):
+                    tools_registered.append(tool.name)
+
+            def __getattr__(self_inner, attr):
+                return getattr(registry, attr)
+
+        wrapped_registry = _TrackingRegistry()
+
         for name, target in (
-            ("register_tools", self._registry),
+            ("register_tools", wrapped_registry),
             ("register_channels", self._channel_manager),
             ("register_providers", self._provider_manager),
             ("register_hooks", None),
@@ -386,6 +428,9 @@ class PluginManager:
             func = getattr(module, name, None)
             if callable(func):
                 func(target, ctx)
+
+        if plugin_name and tools_registered:
+            self._plugin_tools[plugin_name] = tools_registered
 
     def _enabled_from_db(self, name: str) -> int:
         row = self._storage.fetchone("SELECT enabled FROM plugins WHERE name=?", (name,))

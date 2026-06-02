@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -43,16 +44,52 @@ class ToolContext:
 
 
 class ToolRegistry:
-    """Central registry that holds all available tools."""
+    """Central registry that holds all available tools.
+
+    Concurrency / hot-removal semantics (Phase B.5):
+    - register/unregister are protected by a threading.Lock for safety.
+    - Each register/unregister increments _version (allows cache invalidation).
+    - Run-in-progress safety: ``run_agent_step`` calls ``schemas_for`` ONCE at
+      the start of the run and stores the result locally. The LLM sees a
+      snapshot of tools as they existed when the run began. Tool handlers are
+      looked up via ``registry.get(name)`` at call time; if a tool is
+      unregistered mid-run, the next call to it returns "unknown tool" but any
+      tool currently executing (already holding a handler reference) finishes
+      normally. This is "partial snapshot mode" — schemas are snapshotted,
+      handler resolution is live.
+    """
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._lock = threading.Lock()
+        self._version: int = 0
 
     def register(self, tool: Tool) -> None:
         """Register a tool. Raises ValueError on duplicate names."""
-        if tool.name in self._tools:
-            raise ValueError(f"Tool '{tool.name}' is already registered")
-        self._tools[tool.name] = tool
+        with self._lock:
+            if tool.name in self._tools:
+                raise ValueError(f"Tool '{tool.name}' is already registered")
+            self._tools[tool.name] = tool
+            self._version += 1
+
+    def unregister(self, name: str) -> bool:
+        """Remove a tool from the registry. Returns True if removed.
+
+        Hot-removal safety: see class docstring. New runs will not see the
+        tool; runs in-flight that already have a handler reference complete
+        their current call without disruption.
+        """
+        with self._lock:
+            if name in self._tools:
+                del self._tools[name]
+                self._version += 1
+                return True
+            return False
+
+    @property
+    def version(self) -> int:
+        """Increments on every register/unregister. Use to invalidate caches."""
+        return self._version
 
     def get(self, name: str) -> Tool | None:
         """Retrieve a tool by name, or None if not found."""

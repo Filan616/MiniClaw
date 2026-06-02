@@ -634,13 +634,19 @@ def plugins_disable(
         None, "--config", "-c", help="配置文件路径"
     ),
 ) -> None:
-    """Disable a plugin. Registered tools disappear after Gateway restart."""
+    """Disable a plugin. Tools are hot-removed (Phase B.5).
+
+    Effective immediately for new agent runs. Runs in-flight that have
+    already obtained a tool handler reference complete their current call
+    normally without disruption.
+    """
     manager = _plugin_manager(config_path)
     if not manager.disable(name):
         console.print(f"[red]Plugin not found:[/] {name}")
         raise typer.Exit(1)
     console.print(
-        f"[green]Disabled plugin[/] {name}. Restart Gateway to remove already registered tools."
+        f"[green]Disabled plugin[/] {name}. Tools removed from registry; "
+        "new agent runs won't see them."
     )
 
 

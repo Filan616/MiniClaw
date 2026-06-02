@@ -587,13 +587,26 @@ def plugins_install(
 def plugins_enable(
     name: str = typer.Argument(help="Plugin name"),
     yes: bool = typer.Option(False, "--yes", help="Confirm manifest permissions"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Bypass integrity check (audited). Use only when you trust the changes.",
+    ),
     config_path: Optional[Path] = typer.Option(
         None, "--config", "-c", help="配置文件路径"
     ),
 ) -> None:
-    """Enable an installed plugin after manifest confirmation."""
+    """Enable an installed plugin after manifest confirmation.
+
+    Integrity check runs before enabling. In strict mode, hash mismatch fails
+    unless --force is passed (which is always audited).
+    """
     manager = _plugin_manager(config_path)
-    result = manager.enable(name, confirmed=yes)
+    try:
+        result = manager.enable(name, confirmed=yes, force=force)
+    except RuntimeError as exc:
+        console.print(f"[red]Error:[/] {exc}")
+        raise typer.Exit(code=1)
     manifest = result["manifest"]
     console.print("[bold]Plugin manifest[/]")
     console.print_json(data=manifest)
@@ -601,7 +614,14 @@ def plugins_enable(
         if not typer.confirm("Enable this plugin?", default=False):
             console.print("[yellow]Cancelled.[/]")
             raise typer.Exit()
-        manager.enable(name, confirmed=True)
+        try:
+            result = manager.enable(name, confirmed=True, force=force)
+        except RuntimeError as exc:
+            console.print(f"[red]Error:[/] {exc}")
+            raise typer.Exit(code=1)
+    integrity_ok = result.get("integrity_ok", True)
+    if not integrity_ok:
+        console.print(f"[yellow]⚠️ Integrity check bypassed for plugin[/] {name}")
     console.print(f"[green]Enabled plugin[/] {name}")
 
 

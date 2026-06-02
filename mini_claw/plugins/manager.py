@@ -42,13 +42,27 @@ class PluginManager:
         provider_manager: Any,
         storage: Any,
         audit_logger: Any | None = None,
+        integrity_mode: str = "strict",
     ) -> None:
+        """Initialize plugin manager.
+
+        Args:
+            plugins_dir: Directory where plugins are installed
+            registry: Tool registry for plugin tool registration
+            channel_manager: Channel manager for plugin channel registration
+            provider_manager: Provider manager for plugin provider registration
+            storage: Database for persistence
+            audit_logger: Security audit logger (optional)
+            integrity_mode: 'strict' (reject mismatch) or 'warn' (log only).
+                          Default 'strict' for security.
+        """
         self._plugins_dir = plugins_dir
         self._registry = registry
         self._channel_manager = channel_manager
         self._provider_manager = provider_manager
         self._storage = storage
         self._audit_logger = audit_logger or SecurityAuditLogger(storage)
+        self._integrity_mode = integrity_mode
         self._plugins_dir.mkdir(parents=True, exist_ok=True)
 
     def discover(self) -> list[dict[str, Any]]:
@@ -87,12 +101,55 @@ class PluginManager:
         )
         return manifest
 
-    def enable(self, name: str, confirmed: bool = False) -> dict[str, Any]:
+    def enable(self, name: str, confirmed: bool = False, force: bool = False) -> dict[str, Any]:
+        """Enable a plugin with integrity check.
+
+        Args:
+            name: Plugin name
+            confirmed: User has confirmed the manifest permissions
+            force: Bypass integrity check (logs audit event but allows enable)
+
+        Returns:
+            dict with requires_confirmation, manifest, and integrity_status
+
+        Raises:
+            RuntimeError: If integrity check fails and force=False (in strict mode)
+        """
         manifest = self._manifest_for(name)
         if not confirmed:
             return {"requires_confirmation": True, "manifest": manifest}
 
-        manifest_hash = self._compute_hash(self._plugins_dir / name)
+        # Integrity check before enabling
+        plugin_dir = self._plugins_dir / name
+        manifest_hash = self._compute_hash(plugin_dir)
+        declared_hash = (
+            (manifest.get("integrity") or {}).get("sha256")
+            if isinstance(manifest.get("integrity"), dict)
+            else None
+        )
+
+        integrity_ok = True
+        if declared_hash and declared_hash != manifest_hash:
+            integrity_ok = False
+            # Always audit hash mismatch
+            self._audit_logger.log_security_event(
+                "plugin_integrity_mismatch",
+                {
+                    "name": name,
+                    "declared_hash": declared_hash,
+                    "actual_hash": manifest_hash,
+                    "force_bypass": force,
+                    "integrity_mode": self._integrity_mode,
+                },
+            )
+            # Reject if strict mode and not forced
+            if self._integrity_mode == "strict" and not force:
+                raise RuntimeError(
+                    f"Plugin '{name}' integrity check failed: "
+                    f"declared={declared_hash[:16]}... actual={manifest_hash[:16]}... "
+                    f"Use --force to bypass (will be audited)."
+                )
+
         now = int(time.time())
         self._storage.execute(
             "UPDATE plugins SET enabled=1, enabled_at=?, manifest_hash=?, "
@@ -111,9 +168,15 @@ class PluginManager:
                 "name": name,
                 "manifest_hash": manifest_hash,
                 "declared_permissions": manifest.get("permissions", []),
+                "integrity_ok": integrity_ok,
+                "force_bypass": force if not integrity_ok else False,
             },
         )
-        return {"requires_confirmation": False, "manifest": manifest}
+        return {
+            "requires_confirmation": False,
+            "manifest": manifest,
+            "integrity_ok": integrity_ok,
+        }
 
     def disable(self, name: str) -> bool:
         cur = self._storage.execute(
@@ -140,6 +203,22 @@ class PluginManager:
             error_msg = None
             if declared_hash and declared_hash != manifest_hash:
                 error_msg = f"integrity mismatch: declared={declared_hash} actual={manifest_hash}"
+                # Audit the mismatch
+                self._audit_logger.log_security_event(
+                    "plugin_integrity_mismatch",
+                    {
+                        "name": name,
+                        "declared_hash": declared_hash,
+                        "actual_hash": manifest_hash,
+                        "phase": "load",
+                        "integrity_mode": self._integrity_mode,
+                    },
+                )
+                # In strict mode, refuse to load
+                if self._integrity_mode == "strict":
+                    raise RuntimeError(
+                        f"Plugin '{name}' integrity check failed at load time: {error_msg}"
+                    )
 
             module = self._import_entry(name, entry_path)
             ctx = PluginContext(

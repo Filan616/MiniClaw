@@ -110,6 +110,7 @@ def create_components(
         channel_manager=channel_manager,
         provider_manager=provider_manager,
         storage=storage,
+        integrity_mode=config.plugins.integrity_mode,
     )
     plugin_manager.load_enabled()
 

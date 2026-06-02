@@ -53,6 +53,13 @@ class ConcurrencyConfig(BaseModel):
     """Lock acquisition timeout in seconds."""
 
 
+class PluginsConfig(BaseModel):
+    """Plugin system configuration."""
+
+    integrity_mode: Literal["strict", "warn"] = "strict"
+    """Integrity check mode: 'strict' (reject hash mismatch) or 'warn' (log only, allow load)."""
+
+
 class ProviderConfig(BaseModel):
     provider: str = "deepseek"
     api_key: str = ""
@@ -218,6 +225,7 @@ class AppConfig(BaseModel):
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
+    plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     agents_defaults: AgentConfig | None = None
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
 

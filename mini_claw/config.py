@@ -159,6 +159,19 @@ _DEFAULT_SHELL_BLACKLIST: tuple[str, ...] = (
 )
 
 
+class ChainDetectorConfig(BaseModel):
+    """Chain attack detector configuration (Phase A.3)."""
+
+    enabled: bool = True
+    """Enable chain detection. If False, no chain detection runs."""
+
+    session_scope: bool = False
+    """Default False: only run-level detection. True: also persists state for cross-message detection."""
+
+    session_ttl: int = 604800
+    """Session-level state TTL in seconds (default 7 days)."""
+
+
 class PermissionsConfig(BaseModel):
     default_level: str = "L2"
     sandbox_mode: str = "safe"  # "safe" = path sandbox + sensitive check; "bypass" = no restrictions
@@ -170,6 +183,7 @@ class PermissionsConfig(BaseModel):
     high_risk: PermissionsHighRiskConfig = Field(
         default_factory=PermissionsHighRiskConfig
     )
+    chain_detector: ChainDetectorConfig = Field(default_factory=ChainDetectorConfig)
 
 
 class WorkflowTemplateConfig(BaseModel):

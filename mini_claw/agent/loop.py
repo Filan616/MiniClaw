@@ -195,7 +195,7 @@ async def _process_single_tool_call(
 
     # Chain attack detection (post-tool observation)
     if hasattr(ctx, "chain_detector") and ctx.chain_detector:
-        ctx.chain_detector.observe_after_tool(tc, run, result, success=True)
+        ctx.chain_detector.observe_after_tool(tc, run, result, success=True, ctx=ctx)
 
     return {
         "role": "tool",
@@ -460,7 +460,7 @@ async def run_agent_step(
 
             # Chain attack detection (post-tool observation)
             if hasattr(ctx, "chain_detector") and ctx.chain_detector:
-                ctx.chain_detector.observe_after_tool(tc, run, result, success=True)
+                ctx.chain_detector.observe_after_tool(tc, run, result, success=True, ctx=ctx)
 
             run.messages.append({
                 "role": "tool",

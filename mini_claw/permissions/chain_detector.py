@@ -7,8 +7,15 @@ A single tool call in isolation may look benign, but the classic attack chain is
     run_shell("./malware.sh")                              # fire
 
 The blacklist sees each step in isolation and lets each one through; the
-chain only becomes dangerous when correlated across calls *within the same
-AgentRun*. ChainDetector keeps that correlation state on the run itself.
+chain only becomes dangerous when correlated across calls.
+
+Two-layer detection (Phase A.3):
+
+* **Run-level** (default, current behavior): correlation state lives on the
+  ``AgentRun`` instance. Detects chains within a single conversation turn.
+* **Session-level** (opt-in via ``session_scope=True``): correlation state
+  persists in ``session_chain_state`` table, keyed by (chat_id, agent_id).
+  Detects chains across multiple messages with TTL cleanup.
 
 Two-phase API (kept deliberately separate so a tool failure does not poison
 the run state):
@@ -28,7 +35,13 @@ Risk progression (per script path tracked on the run):
 
 from __future__ import annotations
 
+import hashlib
+import time
 from typing import Any, Optional
+
+
+# Default TTL for session-level chain state: 7 days
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 3600
 
 
 # Extensions we treat as "scripts worth tracking" when written.
@@ -67,19 +80,31 @@ RISK_FULL_CHAIN = "full_chain"
 
 
 class ChainDetector:
-    """Detect write -> chmod -> exec chains within a single AgentRun.
+    """Detect write -> chmod -> exec chains within and across AgentRuns.
 
-    The detector is stateless itself; all correlation state lives on the
-    ``AgentRun`` instance via ``run.written_scripts`` (dict[path, content])
-    and ``run.dangerous_actions`` (dict keyed by action type, e.g. "chmod").
+    Run-level: correlation state lives on the ``AgentRun`` instance via
+    ``run.written_scripts`` (dict[path, content]) and ``run.dangerous_actions``.
+
+    Session-level (opt-in): state persists in ``session_chain_state`` table,
+    keyed by (chat_id, agent_id), enabling detection across messages.
     """
 
-    def __init__(self, config: Optional[dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[dict[str, Any]] = None,
+        storage: Any = None,
+    ) -> None:
         config = config or {}
         self._enabled: bool = bool(config.get("enabled", True))
         self._high_risk_keywords: list[str] = list(
             config.get("high_risk_keywords", _DEFAULT_HIGH_RISK_KEYWORDS)
         )
+        # Session-level scope: default OFF for backward compatibility
+        self._session_scope: bool = bool(config.get("session_scope", False))
+        self._session_ttl: int = int(
+            config.get("session_ttl", DEFAULT_SESSION_TTL_SECONDS)
+        )
+        self._storage = storage
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,12 +120,7 @@ class ChainDetector:
 
         Returns a dict ``{"action", "reason", "audit_event"}`` when the call
         completes a malicious chain and should be blocked. Returns ``None``
-        otherwise. The detector never mutates ``run`` here; mutation only
-        happens in :meth:`observe_after_tool` after a successful call.
-
-        ``ctx`` is accepted for parity with the rest of the permission
-        pipeline; it is currently unused but reserved for future per-call
-        scoping (e.g. workspace-aware path matching).
+        otherwise.
         """
         if not self._enabled:
             return None
@@ -113,6 +133,23 @@ class ChainDetector:
         if not cmd:
             return None
 
+        # 1. Check run-level state (fast path)
+        run_decision = self._check_run_level(run, cmd, ctx)
+        if run_decision is not None:
+            return run_decision
+
+        # 2. Check session-level state (cross-message)
+        if self._session_scope and self._storage is not None:
+            session_decision = self._check_session_level(cmd, ctx)
+            if session_decision is not None:
+                return session_decision
+
+        return None
+
+    def _check_run_level(
+        self, run: Any, cmd: str, ctx: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Run-level chain detection (in-memory state)."""
         written_scripts: dict[str, str] = getattr(run, "written_scripts", None) or {}
         dangerous_actions: dict[str, Any] = getattr(run, "dangerous_actions", None) or {}
 
@@ -124,11 +161,6 @@ class ChainDetector:
             matched_script, written_scripts, dangerous_actions
         )
 
-        # Only ``full_chain`` (write + chmod + execute) is a hard block.
-        # ``script_only`` and ``script_and_chmod`` are observed states, not
-        # outcomes of an execute attempt; if the user chose to invoke the
-        # script directly without chmod (e.g. ``python script.py``), the
-        # script_only branch lets it through silently.
         if risk_level != RISK_FULL_CHAIN:
             return None
 
@@ -137,10 +169,11 @@ class ChainDetector:
 
         audit_event = {
             "event_type": "chain_attack_blocked",
-            "tool": tool_name,
+            "tool": "run_shell",
             "command": cmd,
             "script_path": matched_script,
             "risk_level": risk_level,
+            "scope": "run",
             "matched_keywords": matched_keywords,
             "recorded_actions": _serialize_actions(dangerous_actions),
             "agent_id": ctx.get("agent_id") if isinstance(ctx, dict) else None,
@@ -157,30 +190,75 @@ class ChainDetector:
             "audit_event": audit_event,
         }
 
+    def _check_session_level(
+        self, cmd: str, ctx: Any
+    ) -> Optional[dict[str, Any]]:
+        """Session-level chain detection (DB-backed, cross-message).
+
+        Accepts ctx as either dict or AgentContext-like object with
+        ``chat_id`` and ``agent_id`` attributes.
+        """
+        chat_id, agent_id = _ctx_chat_agent(ctx)
+        if not chat_id or not agent_id:
+            return None
+
+        # Fetch all unexpired chain state for this (chat_id, agent_id)
+        now = int(time.time())
+        rows = self._storage.fetchall(
+            "SELECT script_path, chmod_applied FROM session_chain_state "
+            "WHERE chat_id = ? AND agent_id = ? AND expires_at > ?",
+            (chat_id, agent_id, now),
+        )
+        if not rows:
+            return None
+
+        # Find script being executed
+        for row in rows:
+            script_path = row["script_path"]
+            if not script_path:
+                continue
+            if script_path in cmd or f"./{script_path}" in cmd:
+                # Check if chmod was applied
+                if row["chmod_applied"]:
+                    audit_event = {
+                        "event_type": "chain_attack_blocked",
+                        "tool": "run_shell",
+                        "command": cmd,
+                        "script_path": script_path,
+                        "risk_level": RISK_FULL_CHAIN,
+                        "scope": "session",
+                        "agent_id": agent_id,
+                        "chat_id": chat_id,
+                    }
+                    return {
+                        "action": "deny",
+                        "reason": (
+                            "multi-step attack detected across messages "
+                            "(write -> chmod -> execute). debug_id={debug_id}"
+                        ),
+                        "risk_level": RISK_FULL_CHAIN,
+                        "audit_event": audit_event,
+                    }
+        return None
+
     def observe_after_tool(
         self,
         tool_call: Any,
         run: Any,
         result: Any,
         success: bool,
+        ctx: Optional[dict[str, Any]] = None,
     ) -> None:
         """Record state changes from a tool that just ran.
 
-        Only successful calls update state — a failed ``write_file`` or
-        ``chmod`` did not actually change the filesystem, so pretending
-        otherwise would produce false-positive blocks on the next step.
-
-        ``result`` is accepted for symmetry and future result-based heuristics
-        (e.g. parsing chmod output); the current implementation does not
-        consult it.
+        Updates both run-level and (if enabled) session-level state.
         """
         if not self._enabled or not success:
             return
 
         tool_name, args = _unpack_tool_call(tool_call)
 
-        # Lazily ensure containers exist on the run so callers don't have to
-        # remember to pre-init them.
+        # Lazily ensure containers exist on the run
         if getattr(run, "written_scripts", None) is None:
             run.written_scripts = {}
         if getattr(run, "dangerous_actions", None) is None:
@@ -189,7 +267,11 @@ class ChainDetector:
         if tool_name == "write_file":
             path = _coerce_str(args.get("path") or args.get("file"))
             if path and _looks_like_script(path):
-                run.written_scripts[path] = _coerce_str(args.get("content"))
+                content = _coerce_str(args.get("content"))
+                run.written_scripts[path] = content
+                # Also persist to session state if enabled
+                if self._session_scope and self._storage is not None and ctx:
+                    self._persist_script_write(path, content, ctx)
             return
 
         if tool_name == "run_shell":
@@ -197,9 +279,6 @@ class ChainDetector:
             if not cmd:
                 return
             if _is_chmod_executable(cmd):
-                # Track which recorded scripts (if any) this chmod targeted,
-                # so a chmod against an unrelated path doesn't arm execution
-                # of a different script.
                 targets = [
                     path for path in run.written_scripts if path and path in cmd
                 ]
@@ -211,10 +290,82 @@ class ChainDetector:
                 else:
                     run.dangerous_actions["chmod"] = targets if targets else True
 
+                # Also persist chmod to session state if enabled
+                if self._session_scope and self._storage is not None and ctx:
+                    self._persist_chmod(cmd, ctx)
+
+    def _persist_script_write(
+        self, script_path: str, content: str, ctx: Any
+    ) -> None:
+        """Persist a script write to session_chain_state."""
+        chat_id, agent_id = _ctx_chat_agent(ctx)
+        if not chat_id or not agent_id:
+            return
+
+        now = int(time.time())
+        expires_at = now + self._session_ttl
+        content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
+
+        # Upsert: INSERT OR REPLACE
+        self._storage.execute(
+            "INSERT OR REPLACE INTO session_chain_state "
+            "(chat_id, agent_id, script_path, content_hash, chmod_applied, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, "
+            "  COALESCE((SELECT chmod_applied FROM session_chain_state "
+            "    WHERE chat_id=? AND agent_id=? AND script_path=?), 0), "
+            "?, ?)",
+            (chat_id, agent_id, script_path, content_hash,
+             chat_id, agent_id, script_path,
+             now, expires_at),
+        )
+
+    def _persist_chmod(self, cmd: str, ctx: Any) -> None:
+        """Persist a chmod action to session_chain_state."""
+        chat_id, agent_id = _ctx_chat_agent(ctx)
+        if not chat_id or not agent_id:
+            return
+
+        # Find which scripts this chmod targets
+        rows = self._storage.fetchall(
+            "SELECT script_path FROM session_chain_state "
+            "WHERE chat_id = ? AND agent_id = ?",
+            (chat_id, agent_id),
+        )
+        for row in rows:
+            script_path = row["script_path"]
+            if script_path and script_path in cmd:
+                self._storage.execute(
+                    "UPDATE session_chain_state SET chmod_applied = 1 "
+                    "WHERE chat_id = ? AND agent_id = ? AND script_path = ?",
+                    (chat_id, agent_id, script_path),
+                )
+
+    def cleanup_expired(self) -> int:
+        """Remove expired session_chain_state rows.
+
+        Returns:
+            Number of rows deleted.
+        """
+        if self._storage is None:
+            return 0
+        now = int(time.time())
+        cursor = self._storage.execute(
+            "DELETE FROM session_chain_state WHERE expires_at <= ?",
+            (now,),
+        )
+        return cursor.rowcount
+
 
 # ----------------------------------------------------------------------
 # Module helpers (kept module-level so they're easy to unit-test)
 # ----------------------------------------------------------------------
+
+
+def _ctx_chat_agent(ctx: Any) -> tuple[Optional[str], Optional[str]]:
+    """Extract (chat_id, agent_id) from ctx (dict or AgentContext-like)."""
+    if isinstance(ctx, dict):
+        return ctx.get("chat_id"), ctx.get("agent_id")
+    return getattr(ctx, "chat_id", None), getattr(ctx, "agent_id", None)
 
 
 def _unpack_tool_call(tool_call: Any) -> tuple[str, dict[str, Any]]:

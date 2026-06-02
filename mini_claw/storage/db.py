@@ -557,6 +557,21 @@ CREATE TABLE IF NOT EXISTS plugins (
     enabled_at           INTEGER
 );
 
+-- Phase A.3: Cross-message chain attack detection state.
+CREATE TABLE IF NOT EXISTS session_chain_state (
+    chat_id      TEXT NOT NULL,
+    agent_id     TEXT NOT NULL,
+    script_path  TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    chmod_applied INTEGER DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, agent_id, script_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_chain_expires
+ON session_chain_state(expires_at);
+
 -- Observability group
 CREATE TABLE IF NOT EXISTS agent_runs (
     id                  TEXT PRIMARY KEY,

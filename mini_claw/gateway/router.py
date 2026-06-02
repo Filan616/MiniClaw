@@ -85,7 +85,14 @@ class Gateway:
         self._workspace_manager = workspace_manager
         self._session_mgr = SessionManager(storage)
         self._audit_logger = SecurityAuditLogger(storage)
-        self._chain_detector = ChainDetector()
+        self._chain_detector = ChainDetector(
+            config={
+                "enabled": config.permissions.chain_detector.enabled,
+                "session_scope": config.permissions.chain_detector.session_scope,
+                "session_ttl": config.permissions.chain_detector.session_ttl,
+            },
+            storage=storage,
+        )
         self._workflow_store = WorkflowStore(storage)
         self._workflow_planner = WorkflowPlanner(config.workflow)
         self._workflow_prompt_compiler = SubAgentPromptCompiler(config.workflow)

@@ -202,6 +202,37 @@ class WorkflowTemplatesConfig(BaseModel):
     migration: WorkflowTemplateConfig = Field(default_factory=WorkflowTemplateConfig)
 
 
+class WorkflowAutoDetectConfig(BaseModel):
+    """Phase 7: keyword pre-filter + LLM intent classification.
+
+    Only consulted when ``WorkflowConfig.auto_detect`` is True. The pre-filter
+    uses ``WorkflowPlanner.should_use_workflow`` keywords (zero LLM cost). The
+    LLM fallback is invoked only for messages whose length falls in the
+    ``[min_chars, max_chars]`` band — short messages skip workflow, long ones
+    fall through to ``code_review`` via existing length heuristic.
+    """
+
+    min_chars: int = 80
+    max_chars: int = 500
+    llm_timeout_ms: int = 4000
+
+
+class WorkflowPromptReviewConfig(BaseModel):
+    """Phase 7: automatic prompt_reviewer node injection.
+
+    When enabled, every workflow gets a ``prompt_reviewer`` subagent node
+    inserted between the original subagents and the merge node. The reviewer
+    inspects upstream redacted prompts and produces ``{approved, prompt_issues}``.
+    Issues at or above ``severity_threshold`` cause the workflow to escalate to
+    ``awaiting_approval`` for human review.
+    """
+
+    enabled: bool = True
+    severity_threshold: Literal["low", "medium", "high"] = "medium"
+    node_id: str = "prompt_review"
+    timeout: int = 180
+
+
 class WorkflowConfig(BaseModel):
     enabled: bool = False
     auto_detect: bool = False
@@ -214,6 +245,12 @@ class WorkflowConfig(BaseModel):
     max_prompt_chars: int = 12000
     templates: WorkflowTemplatesConfig = Field(default_factory=WorkflowTemplatesConfig)
     risk_policy: WorkflowRiskPolicyConfig = Field(default_factory=WorkflowRiskPolicyConfig)
+    auto_detect_options: WorkflowAutoDetectConfig = Field(
+        default_factory=WorkflowAutoDetectConfig
+    )
+    prompt_review: WorkflowPromptReviewConfig = Field(
+        default_factory=WorkflowPromptReviewConfig
+    )
 
 
 class AgentConfig(BaseModel):
@@ -233,6 +270,194 @@ class AgentConfig(BaseModel):
     route_chat_ids: list[str] = Field(default_factory=list)
 
 
+# ======================================================================
+# Phase 8 RAG configuration (M1)
+# ======================================================================
+# All flags default to False so RAG is opt-in and never changes Phase 0-7
+# behavior unless the user explicitly enables it in config.yaml.
+
+
+class RagNamespacesConfig(BaseModel):
+    context_enabled: bool = False
+    memory_enabled: bool = False
+
+
+class RagBackendConfig(BaseModel):
+    text_search: str = "fts5"  # fts5 | like
+    vector_backend: str = "none"  # none | chroma | milvus | sqlite_vec
+    hybrid_enabled: bool = False
+
+
+class RagFtsConfig(BaseModel):
+    enabled: bool = True
+    top_k: int = 8
+
+
+class RagEmbeddingConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "local"  # local | openai | custom
+    model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    dim: int = 384
+    batch_size: int = 32
+
+
+class RagChromaConfig(BaseModel):
+    persist_dir: str = "./data/chroma"
+    collection_prefix: str = "miniclaw"
+
+
+class RagMilvusConfig(BaseModel):
+    enabled: bool = False
+    uri: str = "http://127.0.0.1:19530"
+    collection_prefix: str = "miniclaw"
+
+
+class RagChunkConfig(BaseModel):
+    max_tokens: int = 800
+    overlap_tokens: int = 100
+    max_file_size_mb: int = 20
+    binary_file_policy: str = "deny"  # deny | allow
+
+
+class RagSecurityConfig(BaseModel):
+    allow_index_in_bypass: bool = False
+    allow_sensitive_index: bool = False
+    require_approval_for_index: bool = False
+    require_approval_for_sensitive_index: bool = True
+    require_approval_for_memory_write: bool = True
+
+
+class RagSharingConfig(BaseModel):
+    allow_workspace_context_sharing: bool = False
+    allow_cross_agent_context: bool = False
+
+
+class RagRetrievalConfig(BaseModel):
+    auto_context_retrieval: bool = False
+    auto_memory_retrieval: bool = False  # Legacy alias for auto_user_memory_retrieval
+    # Phase 9 M9.5: four-channel auto retrieval (default OFF for backward compat)
+    auto_chat_retrieval: bool = False
+    auto_user_memory_retrieval: bool = False
+    auto_workspace_memory_retrieval: bool = False
+    context_top_k: int = 6
+    memory_top_k: int = 3
+    chat_top_k: int = 5  # Phase 9 M9.1
+    min_memory_confidence: float = 0.75
+    include_archived_by_default: bool = False
+
+
+class RagLifecycleConfig(BaseModel):
+    warm_after_days: int = 7
+    archive_after_days: int = 30
+    cold_after_days: int = 90
+    delete_after_days: int = 180
+    log_ttl_days: int = 7
+    keep_tombstone: bool = True
+
+
+class RagAutoIndexConfig(BaseModel):
+    enabled: bool = False
+    max_file_size_mb: int = 5
+    require_non_sensitive: bool = True
+
+
+class RagReindexConfig(BaseModel):
+    chunker_version: str = "chunker.v1"
+    anchor_schema_version: str = "anchor.v1"
+    code_anchor_backend: str = "tree_sitter"
+    rename_similarity_threshold: float = 0.88
+    uncertain_similarity_threshold: float = 0.72
+    parse_error_ratio_threshold: float = 0.20
+    lock_ttl_seconds: int = 600
+
+
+class MemoryControlConfig(BaseModel):
+    """Phase 9 M9.2: Memory control operations configuration."""
+
+    allow_hard_delete: bool = False
+    max_batch_approve: int = 20
+    batch_approve_max: int = 20  # alias for max_batch_approve (per plan spec)
+    max_batch_reject: int = 20  # mc-11: batch safety limit for reject-all operations
+    export_redact_by_default: bool = True
+    # Phase 9 plan additions
+    auto_candidate: bool = True   # plan: auto candidate intake (compaction/task_state/workflow)
+    auto_write: bool = False      # plan: never auto-write memory bypassing approval
+    require_approval: bool = True
+    allow_export: bool = True
+    allow_clear_scope: bool = True
+    auto_candidate_from_agent: bool = False  # Whether to auto-generate candidates from agent summaries
+    export_large_threshold: int = 50  # Plan spec: large export ≥ 50 rows triggers L3
+
+
+class MemoryMaintenanceConfig(BaseModel):
+    """Phase 9 M9.6: Memory maintenance thresholds."""
+
+    enabled: bool = True
+    dupe_threshold: float = 0.85  # Plan spec: 0.85 Jaccard
+    conflict_threshold: float = 0.55
+    stale_age_days: int = 90
+    stale_max_access: int = 1
+    auto_apply: bool = False
+    auto_run_on_compaction: bool = False
+    run_every_days: int = 7
+    # Phase 9 plan additions
+    suggest_only: bool = True  # Never auto-apply, only generate suggestions
+    run_on_startup: bool = False  # Auto-run maintenance scan on startup
+    dedupe_text_threshold: float = 0.85  # Plan spec value
+    dedupe_embedding_threshold: float = 0.92  # For hybrid mode
+    mode: str = "auto"  # auto | text_only | hybrid
+
+
+class MemoryConfig(BaseModel):
+    """Phase 9: Top-level memory configuration container."""
+
+    control: MemoryControlConfig = Field(default_factory=MemoryControlConfig)
+    maintenance: MemoryMaintenanceConfig = Field(default_factory=MemoryMaintenanceConfig)
+
+
+class RagConfig(BaseModel):
+    enabled: bool = False
+    namespaces: RagNamespacesConfig = Field(default_factory=RagNamespacesConfig)
+    backend: RagBackendConfig = Field(default_factory=RagBackendConfig)
+    fts: RagFtsConfig = Field(default_factory=RagFtsConfig)
+    embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
+    chroma: RagChromaConfig = Field(default_factory=RagChromaConfig)
+    milvus: RagMilvusConfig = Field(default_factory=RagMilvusConfig)
+    chunk: RagChunkConfig = Field(default_factory=RagChunkConfig)
+    security: RagSecurityConfig = Field(default_factory=RagSecurityConfig)
+    sharing: RagSharingConfig = Field(default_factory=RagSharingConfig)
+    retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
+    lifecycle: RagLifecycleConfig = Field(default_factory=RagLifecycleConfig)
+    auto_index: RagAutoIndexConfig = Field(default_factory=RagAutoIndexConfig)
+    reindex: RagReindexConfig = Field(default_factory=RagReindexConfig)
+    memory_control: MemoryControlConfig = Field(default_factory=MemoryControlConfig)
+    memory_maintenance: MemoryMaintenanceConfig = Field(default_factory=MemoryMaintenanceConfig)
+
+    @property
+    def memory(self) -> MemoryConfig:
+        """Phase 9 ct-1: Runtime accessor for top-level memory config.
+
+        Returns a synthetic MemoryConfig that reflects current memory_control
+        and memory_maintenance state. This enables code to access config.rag.memory
+        consistently, matching the top-level memory: YAML structure.
+        """
+        return MemoryConfig(
+            control=self.memory_control,
+            maintenance=self.memory_maintenance,
+        )
+
+
+class ChatSearchConfig(BaseModel):
+    """Phase 9 M9.1: Chat search configuration."""
+
+    enabled: bool = False
+    allow_global: bool = False
+    fts_max_results: int = 50
+    # Phase 9 P0.1: workspace scope can optionally include rows whose
+    # ``workspace_dir`` was best-effort-inferred during migration.
+    include_inferred: bool = False
+
+
 class AppConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     channels_feishu: FeishuChannelConfig = Field(default_factory=FeishuChannelConfig)
@@ -242,8 +467,31 @@ class AppConfig(BaseModel):
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+    rag: RagConfig = Field(default_factory=RagConfig)
+    chat_search: ChatSearchConfig = Field(default_factory=ChatSearchConfig)
+    # Phase 9: top-level memory config (mirrors rag.memory_control / rag.memory_maintenance
+    # for forward-compatibility with the planned YAML structure).
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agents_defaults: AgentConfig | None = None
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
+
+    def model_post_init(self, __context) -> None:
+        """Phase 9 ct-1: Ensure top-level memory config propagates to rag.
+
+        When AppConfig is constructed programmatically (not via load_config YAML),
+        the top-level memory: fields should still propagate to rag.memory_control
+        and rag.memory_maintenance so all runtime paths see consistent config.
+        """
+        super().model_post_init(__context)
+        # Only propagate if top-level memory has non-default values
+        if self.memory.control != MemoryControlConfig() or self.memory.maintenance != MemoryMaintenanceConfig():
+            # Merge top-level into rag (top-level wins)
+            self.rag.memory_control = MemoryControlConfig(
+                **{**self.rag.memory_control.model_dump(), **self.memory.control.model_dump(exclude_unset=True)}
+            )
+            self.rag.memory_maintenance = MemoryMaintenanceConfig(
+                **{**self.rag.memory_maintenance.model_dump(), **self.memory.maintenance.model_dump(exclude_unset=True)}
+            )
 
 
 def _merge_agent_defaults(data: dict) -> dict:
@@ -261,6 +509,37 @@ def _merge_agent_defaults(data: dict) -> dict:
 
     data = dict(data)
     data["agents"] = merged_agents
+    return data
+
+
+def _propagate_top_level_memory(data: dict) -> dict:
+    """Phase 9: forward top-level ``memory:`` into rag.memory_control /
+    rag.memory_maintenance so existing call sites (RagManager, router,
+    chain_detector) keep working without ripple changes.
+
+    Top-level wins; existing rag.memory_control/maintenance values are
+    preserved for keys not present at the top level.
+    """
+    mem = data.get("memory")
+    if not isinstance(mem, dict):
+        return data
+
+    rag = data.setdefault("rag", {}) if isinstance(data.get("rag"), dict) or "rag" not in data else data["rag"]
+    if not isinstance(rag, dict):
+        return data
+
+    control_top = mem.get("control") if isinstance(mem.get("control"), dict) else None
+    maint_top = mem.get("maintenance") if isinstance(mem.get("maintenance"), dict) else None
+
+    if control_top:
+        existing = rag.get("memory_control") if isinstance(rag.get("memory_control"), dict) else {}
+        rag["memory_control"] = {**existing, **control_top}
+    if maint_top:
+        existing = rag.get("memory_maintenance") if isinstance(rag.get("memory_maintenance"), dict) else {}
+        rag["memory_maintenance"] = {**existing, **maint_top}
+
+    data = dict(data)
+    data["rag"] = rag
     return data
 
 
@@ -295,5 +574,6 @@ def load_config(path: Path | None = None) -> AppConfig:
             del data["channels"]
         data = _normalize_channels(data)
         data = _merge_agent_defaults(data)
+        data = _propagate_top_level_memory(data)
         return AppConfig(**data)
     return AppConfig()

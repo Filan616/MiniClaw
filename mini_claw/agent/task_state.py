@@ -3,11 +3,11 @@
 A TaskState captures information that must survive when the message history
 is compacted away: the original user request, extracted key facts, and a
 rolling log of recent errors. It is persisted in the ``task_state`` table
-keyed by ``(chat_id, agent_id)``.
+keyed by ``(channel_name, chat_id, agent_id)`` (Phase 9 P0.2: added channel_name for multi-channel isolation).
 
 Persistence layout
 ------------------
-The ``task_state`` table has columns ``goal``, ``test_command``, and
+The ``task_state`` table has columns ``channel_name``, ``goal``, ``test_command``, and
 ``facts_json``. We map our richer dataclass onto it as follows:
 
 * ``goal``        -> ``task_description`` (kept as a column for ad-hoc SQL).
@@ -37,6 +37,9 @@ class TaskState:
     key_facts: list[str] = field(default_factory=list)
     error_log: list[dict] = field(default_factory=list)
     compaction_count: int = 0
+    # Phase 9 M9.4: facts the user has explicitly confirmed (`/pin` or strong
+    # decision sentence). Only these may feed agent-summary memory candidates.
+    confirmed_facts: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Serialization
@@ -49,15 +52,12 @@ class TaskState:
             "key_facts": list(self.key_facts),
             "error_log": [dict(e) for e in self.error_log],
             "compaction_count": self.compaction_count,
+            "confirmed_facts": list(self.confirmed_facts),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TaskState":
-        """Deserialize from a dict produced by :meth:`to_dict`.
-
-        Tolerates ``None`` and missing keys so callers can feed in partial
-        rows without extra guarding.
-        """
+        """Deserialize from a dict produced by :meth:`to_dict`."""
         if not data:
             return cls()
         return cls(
@@ -65,6 +65,7 @@ class TaskState:
             key_facts=list(data.get("key_facts") or []),
             error_log=[dict(e) for e in (data.get("error_log") or [])],
             compaction_count=int(data.get("compaction_count") or 0),
+            confirmed_facts=list(data.get("confirmed_facts") or []),
         )
 
     # ------------------------------------------------------------------
@@ -81,6 +82,18 @@ class TaskState:
         if normalized in self.key_facts:
             return
         self.key_facts.append(normalized)
+
+    def confirm_fact(self, fact: str) -> None:
+        """Phase 9 M9.4: mark a fact as user-confirmed (pinned)."""
+        if not fact:
+            return
+        normalized = fact.strip()
+        if not normalized:
+            return
+        if normalized not in self.confirmed_facts:
+            self.confirmed_facts.append(normalized)
+        if normalized not in self.key_facts:
+            self.key_facts.append(normalized)
 
     def add_error(self, error_msg: str, run_id: str) -> None:
         """Append an error to the rolling log, capped at ``_MAX_ERROR_LOG``."""
@@ -101,8 +114,11 @@ class TaskState:
     # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, storage: Any, chat_id: str, agent_id: str) -> None:
-        """Upsert this state into the ``task_state`` table."""
+    def save(self, storage: Any, chat_id: str, agent_id: str, channel_name: str = "legacy") -> None:
+        """Upsert this state into the ``task_state`` table.
+
+        Phase 9 P0.2: Added channel_name parameter for multi-channel isolation.
+        """
         payload = {
             "key_facts": list(self.key_facts),
             "error_log": [dict(e) for e in self.error_log],
@@ -110,13 +126,14 @@ class TaskState:
         }
         storage.execute(
             "INSERT INTO task_state "
-            "(chat_id, agent_id, goal, facts_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(chat_id, agent_id) DO UPDATE SET "
+            "(channel_name, chat_id, agent_id, goal, facts_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(channel_name, chat_id, agent_id) DO UPDATE SET "
             "goal=excluded.goal, "
             "facts_json=excluded.facts_json, "
             "updated_at=excluded.updated_at",
             (
+                channel_name,
                 chat_id,
                 agent_id,
                 self.task_description,
@@ -126,12 +143,15 @@ class TaskState:
         )
 
     @classmethod
-    def load(cls, storage: Any, chat_id: str, agent_id: str) -> "TaskState":
-        """Load state for ``(chat_id, agent_id)``, or return a fresh instance."""
+    def load(cls, storage: Any, chat_id: str, agent_id: str, channel_name: str = "legacy") -> "TaskState":
+        """Load state for ``(channel_name, chat_id, agent_id)``, or return a fresh instance.
+
+        Phase 9 P0.2: Added channel_name parameter for multi-channel isolation.
+        """
         row = storage.fetchone(
             "SELECT goal, facts_json FROM task_state "
-            "WHERE chat_id = ? AND agent_id = ?",
-            (chat_id, agent_id),
+            "WHERE channel_name = ? AND chat_id = ? AND agent_id = ?",
+            (channel_name, chat_id, agent_id),
         )
         if not row:
             return cls()

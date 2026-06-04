@@ -22,3 +22,7 @@ class AgentContext:
     system_prompt: str | None = None
     skill_manager: Any = None
     storage: Any = None  # Database for stats persistence (Phase B.4)
+    rag_manager: Any = None  # Phase 8 M2: RagManager instance
+    session_id: str | None = None  # Phase 9 P0.1: stable session id (sha1 of channel|chat|thread|agent)
+    channel_name: str | None = None  # Phase 9 P0.1: channel of this run (feishu / cli / ...)
+    chat_search_manager: Any = None  # Phase 9 M9.1: ChatSearchManager instance

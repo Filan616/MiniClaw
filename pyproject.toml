@@ -21,6 +21,18 @@ dependencies = [
 [project.optional-dependencies]
 browser = ["playwright>=1.44"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx"]
+# Phase 8 M4: vector retrieval (Chroma + local embeddings).
+# Heavy deps; opt-in with: pip install -e '.[rag-vector]'
+rag-vector = [
+    "chromadb>=0.4",
+    "sentence-transformers>=2.2",
+]
+# Phase 8.3.5: code anchors for incremental reindex.
+# Opt-in with: pip install -e '.[rag-code]'
+rag-code = [
+    "tree-sitter>=0.22",
+    "tree-sitter-language-pack>=0.7",
+]
 
 [project.scripts]
 mini-claw = "mini_claw.cli:app"

@@ -92,6 +92,86 @@ def create_components(
     if expired:
         logger.info(f"Expired {expired} old pending approvals on startup")
 
+    # Phase 8 M2: RAG tools (conditional registration based on config)
+    rag_manager = None
+    if config.rag.enabled and config.rag.namespaces.context_enabled:
+        from mini_claw.rag.manager import RagManager
+        from mini_claw.tools.rag_tools import (
+            TOOL_ARCHIVE_CONTEXT,
+            TOOL_CLEAR_CONTEXT,
+            TOOL_DELETE_CONTEXT,
+            TOOL_DIFF_CONTEXT,
+            TOOL_INDEX_CONTEXT,
+            TOOL_INSPECT_CONTEXT,
+            TOOL_LIST_CONTEXTS,
+            TOOL_RAG_STATUS,
+            TOOL_READ_SENSITIVE_CONTEXT,
+            TOOL_REBIND_CONTEXT,
+            TOOL_REEMBED_CONTEXT,
+            TOOL_REINDEX_CONTEXT,
+            TOOL_SEARCH_CONTEXT,
+        )
+        rag_manager = RagManager(storage, config.rag, policy)
+        for tool in [
+            TOOL_INDEX_CONTEXT,
+            TOOL_SEARCH_CONTEXT,
+            TOOL_LIST_CONTEXTS,
+            TOOL_INSPECT_CONTEXT,
+            TOOL_CLEAR_CONTEXT,
+            TOOL_ARCHIVE_CONTEXT,
+            TOOL_DELETE_CONTEXT,
+            TOOL_READ_SENSITIVE_CONTEXT,
+            TOOL_REINDEX_CONTEXT,  # Phase 8 M3
+            TOOL_DIFF_CONTEXT,     # Phase 8.3.5
+            TOOL_REEMBED_CONTEXT,  # Phase 8.3.5
+            TOOL_REBIND_CONTEXT,   # Phase 8 M3
+            TOOL_RAG_STATUS,       # Phase 8 M4.5
+        ]:
+            registry.register(tool)
+        logger.info("RAG context tools registered (rag.enabled=%s)", config.rag.enabled)
+
+    # Phase 8 M5: memory tools (independent gate — memory namespace can be on
+    # without context namespace, e.g. for explicit /memory remember only)
+    if config.rag.enabled and config.rag.namespaces.memory_enabled:
+        from mini_claw.tools.rag_tools import (
+            TOOL_MEMORY_COMPACT_TO_RAG,
+            TOOL_MEMORY_DELETE,
+            TOOL_MEMORY_INSPECT,
+            TOOL_MEMORY_LIST,
+            TOOL_MEMORY_PIN,
+            TOOL_MEMORY_REMEMBER,
+            TOOL_MEMORY_SEARCH,
+            TOOL_MEMORY_UNPIN,
+        )
+        if rag_manager is None:
+            # Memory-only mode: still need a RagManager
+            from mini_claw.rag.manager import RagManager
+            rag_manager = RagManager(storage, config.rag, policy)
+        for tool in [
+            TOOL_MEMORY_REMEMBER,
+            TOOL_MEMORY_SEARCH,
+            TOOL_MEMORY_LIST,
+            TOOL_MEMORY_INSPECT,
+            TOOL_MEMORY_PIN,
+            TOOL_MEMORY_UNPIN,
+            TOOL_MEMORY_DELETE,
+            TOOL_MEMORY_COMPACT_TO_RAG,
+        ]:
+            registry.register(tool)
+        logger.info("RAG memory tools registered (memory_enabled=True)")
+
+    # Phase 9 M9.1: chat_search tool (gated by config.chat_search.enabled)
+    chat_search_manager = None
+    if config.chat_search.enabled:
+        from mini_claw.chat_search.manager import ChatSearchManager
+        from mini_claw.tools.chat_tools import TOOL_SEARCH_CHAT
+
+        chat_search_manager = ChatSearchManager(
+            storage, config.chat_search.__dict__ if hasattr(config.chat_search, "__dict__") else {}
+        )
+        registry.register(TOOL_SEARCH_CHAT)
+        logger.info("Chat search tool registered (chat_search.enabled=True)")
+
     # Workspaces — one filesystem dir per agent, co-located with the db
     workspace_manager = WorkspaceManager(base_dir=data_dir / "workspaces")
     workspace_manager.load_workspaces(config.agents)
@@ -126,6 +206,8 @@ def create_components(
         agent_manager=agent_manager,
         channel_manager=channel_manager,
         skill_manager=skill_manager,
+        rag_manager=rag_manager,
+        chat_search_manager=chat_search_manager,
     )
     channel_manager.set_gateway(gateway)
     channel_manager.load_enabled()
@@ -146,6 +228,7 @@ def create_components(
         "plugin_manager": plugin_manager,
         "result_processor": result_processor,
         "gateway": gateway,
+        "rag_manager": rag_manager,  # Phase 8 M2
     }
 
 
@@ -164,6 +247,44 @@ def create_app(config: AppConfig, config_path: Path | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         # Startup: recover stale processing events from crashes
         _recover_stale_events(components["storage"])
+
+        # Phase 8 M3: opportunistic RAG lifecycle cleanup at startup.
+        # Cheap pass — async loop covers periodic cleanup later.
+        rag_mgr = components.get("rag_manager")
+        if rag_mgr is not None:
+            try:
+                counts = rag_mgr.cleanup_lifecycle()
+                if any(counts.values()):
+                    logger.info("RAG lifecycle cleanup at startup: %s", counts)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RAG lifecycle cleanup failed at startup: %s", exc)
+
+        # Phase 9 M9.6: memory maintenance scan at startup (gated by config)
+        if (
+            rag_mgr is not None
+            and config.rag.memory_maintenance.run_on_startup
+            and config.rag.namespaces.memory_enabled
+        ):
+            try:
+                # Startup scan uses 'all' scope and always persists suggestions
+                ctx = {
+                    "agent_id": "system",
+                    "chat_id": "startup",
+                    "channel_name": "system",
+                    "workspace_dir": None,
+                }
+                result = rag_mgr.run_memory_maintenance(ctx=ctx, scope="all", persist=True)
+                if result.get("scanned_count", 0) > 0:
+                    logger.info(
+                        "Memory maintenance at startup: scanned=%d, duplicates=%d, conflicts=%d, stale=%d, suggestions=%d",
+                        result.get("scanned_count", 0),
+                        len(result.get("duplicates", [])),
+                        len(result.get("conflicts", [])),
+                        len(result.get("stale", [])),
+                        len(result.get("suggestion_ids", [])),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Memory maintenance failed at startup: %s", exc)
 
         await channel_manager.start_all()
         try:

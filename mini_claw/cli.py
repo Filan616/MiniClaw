@@ -31,6 +31,8 @@ plugins_app = typer.Typer(help="Plugin 管理")
 tasks_app = typer.Typer(help="定时任务管理")
 runs_app = typer.Typer(help="运行记录查看")
 stats_app = typer.Typer(help="使用统计 (token/耗时)")
+rag_app = typer.Typer(help="RAG 子系统状态 (Phase 8)")
+chat_search_app = typer.Typer(help="对话搜索索引 (Phase 9 M9.1)")
 
 app.add_typer(agents_app, name="agents")
 app.add_typer(skills_app, name="skills")
@@ -38,6 +40,8 @@ app.add_typer(plugins_app, name="plugins")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(runs_app, name="runs")
 app.add_typer(stats_app, name="stats")
+app.add_typer(rag_app, name="rag")
+app.add_typer(chat_search_app, name="chat-search")
 
 console = Console()
 
@@ -209,6 +213,43 @@ agents:
       - read_file
       - write_file
       - list_directory
+
+# Phase 9 — chat search (messages_fts)
+chat_search:
+  enabled: false
+  allow_global: false
+  fts_max_results: 50
+  include_inferred: false
+
+# Phase 9 — memory control & maintenance.
+# Top-level keys are mirrored into rag.memory_control / rag.memory_maintenance
+# at load time, so either layout works. Top-level wins on conflict.
+memory:
+  control:
+    auto_candidate: true
+    auto_write: false
+    require_approval: true
+    allow_export: true
+    allow_clear_scope: true
+    auto_candidate_from_agent: false
+    export_large_threshold: 50
+    batch_approve_max: 20
+  maintenance:
+    enabled: true
+    auto_apply: false
+    suggest_only: true
+    run_on_startup: false
+    run_every_days: 7
+    dedupe_text_threshold: 0.85
+    dedupe_embedding_threshold: 0.92
+
+# Phase 9 — auto retrieval (default OFF; manual tools always work)
+rag:
+  retrieval:
+    auto_chat_retrieval: false
+    auto_context_retrieval: false
+    auto_user_memory_retrieval: false
+    auto_workspace_memory_retrieval: false
 """
 
 
@@ -913,3 +954,157 @@ def stats_top_tools(
             str(row["errors"] or 0),
         )
     console.print(table)
+
+
+# ============================================================
+# Phase 8 M4.5: rag status
+# ============================================================
+
+
+@rag_app.command("status")
+def rag_status(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+) -> None:
+    """显示 RAG 子系统的健康快照 (FTS / 向量后端 / embedding / lifecycle 计数)。"""
+    from mini_claw.permissions.policy import PermissionPolicy
+    from mini_claw.rag.manager import RagManager
+    from mini_claw.storage import Database
+
+    cfg = load_config(config)
+    if not cfg.rag.enabled:
+        if as_json:
+            import json as _json
+            console.print_json(_json.dumps({"enabled": False, "reason": "rag.enabled=false"}))
+        else:
+            console.print("RAG is disabled. Set rag.enabled=true in config.yaml to use it.")
+        raise typer.Exit(code=0)
+
+    storage = Database(_db_path(config))
+    policy = PermissionPolicy(cfg.permissions)
+    mgr = RagManager(storage, cfg.rag, policy)
+
+    if as_json:
+        import json as _json
+        console.print_json(_json.dumps(mgr.status_dict()))
+    else:
+        console.print(mgr.status_text())
+
+
+# ============================================================
+# Phase 9 M9.1: chat-search rebuild / status CLI
+# ============================================================
+
+
+@chat_search_app.command("rebuild")
+def chat_search_rebuild(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+) -> None:
+    """重建 messages_fts 镜像索引 (Phase 9 M9.1)。
+
+    扫描 messages 全表，DELETE FROM messages_fts，然后逐行 INSERT。
+    审计三事件：started / completed / failed。
+    """
+    from mini_claw.audit.logger import AuditLogger
+    from mini_claw.chat_search.manager import ChatSearchManager
+    from mini_claw.storage import Database
+
+    cfg = load_config(config)
+    if not getattr(cfg, "chat_search", None) or not cfg.chat_search.enabled:
+        if as_json:
+            import json as _json
+            console.print_json(
+                _json.dumps({"enabled": False, "reason": "chat_search.enabled=false"})
+            )
+        else:
+            console.print(
+                "Chat search is disabled. Set chat_search.enabled=true in config.yaml."
+            )
+        raise typer.Exit(code=0)
+
+    storage = Database(_db_path(config))
+    audit = AuditLogger(storage)
+    chat_search_cfg = {
+        "enabled": cfg.chat_search.enabled,
+        "allow_global": cfg.chat_search.allow_global,
+        "fts_max_results": cfg.chat_search.fts_max_results,
+        "include_inferred": getattr(cfg.chat_search, "include_inferred", False),
+    }
+    mgr = ChatSearchManager(storage, chat_search_cfg)
+
+    total_row = storage.fetchone(
+        "SELECT COUNT(*) AS cnt FROM messages WHERE content IS NOT NULL"
+    )
+    total_messages = int(total_row["cnt"]) if total_row else 0
+
+    audit.log_security_event(
+        event_type="chat_search_rebuild_started",
+        details={"total_messages": total_messages, "scope": "all"},
+    )
+
+    try:
+        result = mgr.rebuild_index()
+    except Exception as exc:
+        audit.log_security_event(
+            event_type="chat_search_rebuild_failed",
+            details={"error": str(exc), "partial_count": 0},
+        )
+        if as_json:
+            import json as _json
+            console.print_json(_json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            console.print(f"[red][ERROR][/red] rebuild failed: {exc}")
+        raise typer.Exit(code=1)
+
+    audit.log_security_event(
+        event_type="chat_search_rebuild_completed",
+        details={
+            "indexed": result["indexed"],
+            "skipped": result["skipped"],
+            "duration_ms": result["duration_ms"],
+        },
+    )
+
+    if as_json:
+        import json as _json
+        console.print_json(_json.dumps({"ok": True, **result}))
+    else:
+        console.print(
+            f"[green]✓[/green] Rebuilt messages_fts: "
+            f"total={result['total']}, indexed={result['indexed']}, "
+            f"skipped={result['skipped']}, duration_ms={result['duration_ms']}"
+        )
+
+
+@chat_search_app.command("status")
+def chat_search_status(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON 格式"),
+) -> None:
+    """显示 chat search 索引状态 (FTS 可用性 / 行数对齐)。"""
+    from mini_claw.chat_search.manager import ChatSearchManager
+    from mini_claw.storage import Database
+
+    cfg = load_config(config)
+    storage = Database(_db_path(config))
+    chat_search_cfg = {
+        "enabled": getattr(cfg.chat_search, "enabled", False) if hasattr(cfg, "chat_search") else False,
+        "allow_global": getattr(cfg.chat_search, "allow_global", False) if hasattr(cfg, "chat_search") else False,
+        "fts_max_results": getattr(cfg.chat_search, "fts_max_results", 50) if hasattr(cfg, "chat_search") else 50,
+    }
+    mgr = ChatSearchManager(storage, chat_search_cfg)
+    status = mgr.get_status()
+    status["enabled"] = chat_search_cfg["enabled"]
+
+    if as_json:
+        import json as _json
+        console.print_json(_json.dumps(status))
+    else:
+        console.print(
+            f"chat_search enabled       : {status['enabled']}\n"
+            f"FTS5 available            : {status['fts_available']}\n"
+            f"messages (content!=NULL)  : {status['total_messages']}\n"
+            f"messages_fts rows         : {status['fts_count']}\n"
+            f"index drift               : {status['total_messages'] - status['fts_count']}"
+        )

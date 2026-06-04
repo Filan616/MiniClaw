@@ -43,6 +43,7 @@ class AgentRun:
     allowed_tools: list[str] = field(default_factory=list)
     dangerous_actions: dict[str, Any] = field(default_factory=dict)
     written_scripts: dict[str, str] = field(default_factory=dict)
+    rag_injected: bool = False  # Phase 8 M3: prevents double-injection across iterations
 
 
 def _call_signature(call_name: str, call_args: dict[str, Any]) -> str:
@@ -52,7 +53,11 @@ def _call_signature(call_name: str, call_args: dict[str, Any]) -> str:
 
 
 def _build_tool_context(ctx: AgentContext) -> ToolContext:
-    """Create a ToolContext from an AgentContext."""
+    """Create a ToolContext from an AgentContext.
+
+    Phase 9 M9.5: Added session_id and channel_name for scope filtering.
+    Phase 9 M9.1: Added chat_search_manager for search_chat tool.
+    """
     return ToolContext(
         workspace_dir=ctx.workspace_dir,
         chat_id=ctx.chat_id,
@@ -61,6 +66,10 @@ def _build_tool_context(ctx: AgentContext) -> ToolContext:
         sandbox_mode=ctx.sandbox_mode,
         audit_logger=ctx.audit_logger,
         chain_detector=getattr(ctx, "chain_detector", None),
+        rag_manager=getattr(ctx, "rag_manager", None),
+        session_id=getattr(ctx, "session_id", None),
+        channel_name=getattr(ctx, "channel_name", None),
+        chat_search_manager=getattr(ctx, "chat_search_manager", None),
     )
 
 
@@ -89,13 +98,161 @@ def _messages_for_provider(run: AgentRun, ctx: AgentContext) -> list[dict[str, A
         if fragment:
             prompt_parts.append(fragment)
 
-    if not prompt_parts:
-        return run.messages
+    # Phase 8 M3 + Phase 9 M9.5: opportunistic four-channel RAG injection.
+    # - Only fires when relevant managers are present AND ``rag.retrieval.auto_*`` is on.
+    # - Only fires once per run (``run.rag_injected`` guard).
+    # - Defaults are False, so existing tests/behavior are unaffected.
+    # - Four independent channels:
+    #   1. auto_context_retrieval        -> [Retrieved Context]
+    #   2. auto_user_memory_retrieval    -> [Retrieved User Memory] (legacy: auto_memory_retrieval)
+    #   3. auto_workspace_memory_retrieval -> [Retrieved Workspace Memory]
+    #   4. auto_chat_retrieval           -> [Retrieved Chat History]
+    base_messages = run.messages
+    rag_blocks: list[str] = []
+    rag_mgr = getattr(ctx, "rag_manager", None)
+    chat_search_mgr = getattr(ctx, "chat_search_manager", None)
 
-    system_message = {"role": "system", "content": "\n\n".join(prompt_parts)}
-    if run.messages and run.messages[0].get("role") == "system":
-        return [system_message, *run.messages[1:]]
-    return [system_message, *run.messages]
+    if (rag_mgr is not None or chat_search_mgr is not None) and not run.rag_injected:
+        try:
+            user_text = _last_user_text(run.messages)
+            if user_text:
+                from mini_claw.rag.injector import (
+                    build_chat_history_block,
+                    build_context_block,
+                    build_memory_block,
+                    build_workspace_memory_block,
+                )
+                from mini_claw.rag.query_router import decide_query_route
+
+                route = decide_query_route(user_text)
+
+                # === Channel 1: Context retrieval ===
+                if rag_mgr is not None:
+                    cfg = rag_mgr.config
+                    want_context = (
+                        cfg.retrieval.auto_context_retrieval
+                        and cfg.namespaces.context_enabled
+                        and route in ("context", "both")
+                    )
+                    if want_context:
+                        chunks, _err = rag_mgr.search_context(
+                            user_text,
+                            ctx={
+                                "agent_id": ctx.agent_id,
+                                "workspace_dir": ctx.workspace_dir,
+                                "session_id": getattr(ctx, "session_id", None),
+                                "chat_id": ctx.chat_id,
+                                "channel_name": getattr(ctx, "channel_name", None),
+                            },
+                        )
+                        if chunks:
+                            rag_blocks.append(build_context_block(chunks))
+
+                # === Channel 2: User memory retrieval ===
+                if rag_mgr is not None:
+                    cfg = rag_mgr.config
+                    # Honor both new and legacy config flags
+                    auto_user_mem = (
+                        cfg.retrieval.auto_user_memory_retrieval
+                        or cfg.retrieval.auto_memory_retrieval  # legacy alias
+                    )
+                    want_user_memory = (
+                        auto_user_mem
+                        and cfg.namespaces.memory_enabled
+                        and route in ("memory", "both")
+                    )
+                    if want_user_memory and hasattr(rag_mgr, "search_memory"):
+                        memories, _err = rag_mgr.search_memory(
+                            user_text,
+                            ctx={
+                                "agent_id": ctx.agent_id,
+                                "session_id": getattr(ctx, "session_id", None),
+                                "channel_name": getattr(ctx, "channel_name", None),
+                            },
+                            scope="agent",
+                        )
+                        if memories:
+                            rag_blocks.append(build_memory_block(memories))
+
+                # === Channel 3: Workspace memory retrieval ===
+                if rag_mgr is not None and ctx.workspace_dir is not None:
+                    cfg = rag_mgr.config
+                    want_workspace_memory = (
+                        cfg.retrieval.auto_workspace_memory_retrieval
+                        and cfg.namespaces.memory_enabled
+                        and route in ("memory", "both")
+                    )
+                    if want_workspace_memory and hasattr(rag_mgr, "search_memory"):
+                        ws_memories, _err = rag_mgr.search_memory(
+                            user_text,
+                            ctx={
+                                "agent_id": ctx.agent_id,
+                                "workspace_dir": ctx.workspace_dir,
+                                "session_id": getattr(ctx, "session_id", None),
+                                "channel_name": getattr(ctx, "channel_name", None),
+                            },
+                            scope="workspace",
+                        )
+                        if ws_memories:
+                            rag_blocks.append(build_workspace_memory_block(ws_memories))
+
+                # === Channel 4: Chat history retrieval ===
+                # Works independently with chat_search_mgr; rag_mgr only needed for config flag
+                if chat_search_mgr is not None:
+                    # Check auto_chat_retrieval flag from rag_mgr if available
+                    want_chat = False
+                    chat_top_k = 5  # default
+                    if rag_mgr is not None:
+                        cfg = rag_mgr.config
+                        want_chat = cfg.retrieval.auto_chat_retrieval
+                        chat_top_k = cfg.retrieval.chat_top_k
+
+                    if want_chat:
+                        try:
+                            # Build a SimpleNamespace-like ctx for ChatSearchRetriever
+                            from types import SimpleNamespace
+                            chat_ctx = SimpleNamespace(
+                                agent_id=ctx.agent_id,
+                                chat_id=ctx.chat_id,
+                                workspace_dir=ctx.workspace_dir,
+                                session_id=getattr(ctx, "session_id", None),
+                                channel_name=getattr(ctx, "channel_name", None),
+                            )
+                            chat_results = chat_search_mgr.search(
+                                user_text,
+                                scope="current_session",
+                                ctx=chat_ctx,
+                                top_k=chat_top_k,
+                            )
+                            if chat_results:
+                                rag_blocks.append(build_chat_history_block(chat_results))
+                        except (ValueError, AttributeError):
+                            # Fail-closed scope or missing ctx fields: skip silently
+                            pass
+
+                run.rag_injected = True
+        except Exception:
+            # Never let auto-retrieval break the loop.
+            run.rag_injected = True
+
+    if not prompt_parts and not rag_blocks:
+        return base_messages
+
+    # Compose system prompt: agent system prompt + skills first, then RAG blocks.
+    parts = list(prompt_parts) + rag_blocks
+    system_message = {"role": "system", "content": "\n\n".join(parts)}
+    if base_messages and base_messages[0].get("role") == "system":
+        return [system_message, *base_messages[1:]]
+    return [system_message, *base_messages]
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """Return the most recent user message content (or empty)."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            return content if isinstance(content, str) else ""
+    return ""
 
 
 async def _process_single_tool_call(
@@ -167,19 +324,27 @@ async def _process_single_tool_call(
     if hasattr(ctx, "chain_detector") and ctx.chain_detector:
         blocked = ctx.chain_detector.evaluate_before_tool(tc, run, ctx)
         if blocked:
+            chain_action = blocked.get("action", "deny")
+            audit_event = blocked.get("audit_event") or {}
+            event_type = audit_event.get("event_type", "chain_attack_blocked")
             debug_id = ""
             if ctx.audit_logger:
                 debug_id = ctx.audit_logger.log_security_event(
-                    event_type="chain_attack_blocked",
-                    details=blocked,
+                    event_type=event_type,
+                    details=audit_event,
                     chat_id=ctx.chat_id,
                     agent_id=ctx.agent_id,
                 )
-            return {
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": f"[denied] Chain attack detected. debug_id={debug_id}",
-            }
+            # Phase 9 横切: warn = audit only, do NOT block tool execution
+            if chain_action == "warn":
+                # Fall through to normal execution; auditing has occurred.
+                pass
+            else:
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": f"[denied] Chain attack detected. debug_id={debug_id}",
+                }
 
     # Phase B.4: Record tool call duration
     start_time = time.monotonic()
@@ -472,20 +637,25 @@ async def run_agent_step(
             if hasattr(ctx, "chain_detector") and ctx.chain_detector:
                 blocked = ctx.chain_detector.evaluate_before_tool(tc, run, ctx)
                 if blocked:
+                    chain_action = blocked.get("action", "deny")
+                    audit_event = blocked.get("audit_event") or {}
+                    event_type = audit_event.get("event_type", "chain_attack_blocked")
                     debug_id = ""
                     if ctx.audit_logger:
                         debug_id = ctx.audit_logger.log_security_event(
-                            event_type="chain_attack_blocked",
-                            details=blocked,
+                            event_type=event_type,
+                            details=audit_event,
                             chat_id=ctx.chat_id,
                             agent_id=ctx.agent_id,
                         )
-                    run.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": f"[denied] Chain attack detected. debug_id={debug_id}",
-                    })
-                    continue
+                    # Phase 9 横切: warn = audit only, continue execution
+                    if chain_action != "warn":
+                        run.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"[denied] Chain attack detected. debug_id={debug_id}",
+                        })
+                        continue
 
             try:
                 result = await tool.handler(**tc.arguments, ctx=tool_ctx)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import Any
@@ -18,6 +19,23 @@ _MAX_ACTIVE_SUMMARIES = 3
 
 # Pattern for harvesting error lines from compacted message bodies.
 _RE_ERROR_LINE = re.compile(r"\[ERROR\][^\n]*")
+
+
+def derive_session_id(
+    channel_name: str,
+    chat_id: str,
+    agent_id: str,
+    thread_id: str | None = None,
+) -> str:
+    """Derive a stable session_id from the (channel, chat, thread, agent) tuple.
+
+    Phase 9 P0.1: ``session_id`` MUST be stable across runs and compactions, so
+    do NOT pass ``run_id`` as a substitute. Same logical conversation yields the
+    same id forever, which is what /chat search --session current and active
+    contexts depend on.
+    """
+    raw = f"{channel_name}|{chat_id}|{thread_id or ''}|{agent_id}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 class SessionManager:
@@ -198,13 +216,15 @@ class SessionManager:
         This ensures the LLM sees: [Summary] -> [Recent messages]
         """
         # Get all uncompacted messages ordered by id
+        # Phase 9 P0.6: Strict channel_name matching enforced (legacy compatibility removed)
         rows = self._storage.fetchall(
             "SELECT role, content, tool_calls, tool_call_id, is_compaction_summary "
             "FROM messages "
             "WHERE chat_id = ? AND agent_id = ? "
+            "AND channel_name = ? "
             "AND COALESCE(compacted, 0) = 0 "
             "ORDER BY id ASC",
-            (chat_id, agent_id),
+            (chat_id, agent_id, channel_name),
         )
 
         # Separate into compaction summaries and normal messages
@@ -244,14 +264,45 @@ class SessionManager:
         content: str | None,
         run_id: str | None = None,
         channel_name: str = "feishu",
+        workspace_dir: str | None = None,
     ) -> None:
-        """Persist a message to the history store."""
+        """Persist a message to the history store.
+
+        Phase 9 P0.6: ``channel_name`` and ``workspace_dir`` must be provided
+        for all new messages. Strict channel_name matching is now enforced in
+        get_history / count_messages (legacy compatibility removed).
+
+        Phase 9 M9.1: Also mirrors to messages_fts for chat_search.
+        """
         now = int(time.time())
-        self._storage.execute(
-            "INSERT INTO messages (chat_id, agent_id, run_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, agent_id, run_id, role, content, now),
+        cursor = self._storage.execute(
+            "INSERT INTO messages (chat_id, agent_id, run_id, role, content, created_at, "
+            "channel_name, workspace_dir, workspace_dir_inferred) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, agent_id, run_id, role, content, now, channel_name, workspace_dir, 0),
         )
+        message_id = cursor.lastrowid
+
+        # Phase 9 M9.1: mirror to messages_fts (silent failure if FTS5 unavailable)
+        if message_id and content:
+            from mini_claw.chat_search.indexer import index_message_row
+            try:
+                session_id = derive_session_id(channel_name, chat_id, agent_id)
+                index_message_row(
+                    self._storage,
+                    message_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    chat_id=chat_id,
+                    channel_name=channel_name,
+                    workspace_dir=workspace_dir,
+                    role=role,
+                    content=content,
+                    created_at=now,
+                )
+            except Exception:
+                # Mirror failures must not block message persistence
+                pass
 
     def count_messages(
         self, chat_id: str, agent_id: str, channel_name: str = "feishu"
@@ -261,12 +312,15 @@ class SessionManager:
         Compaction summaries are still counted because they remain
         ``compacted=0`` in the schema; callers comparing against a threshold
         should be aware that summaries contribute to the total.
+
+        Phase 9 P0.6: Strict channel_name matching enforced (legacy compatibility removed).
         """
         row = self._storage.fetchone(
             "SELECT COUNT(*) AS cnt FROM messages "
             "WHERE chat_id = ? AND agent_id = ? "
+            "AND channel_name = ? "
             "AND COALESCE(compacted, 0) = 0",
-            (chat_id, agent_id),
+            (chat_id, agent_id, channel_name),
         )
         if not row:
             return 0
@@ -282,6 +336,7 @@ class SessionManager:
         agent_id: str,
         keep_recent: int = DEFAULT_KEEP_RECENT,
         channel_name: str = "feishu",
+        workspace_dir: str | None = None,
     ) -> int:
         """Compact older messages into a system summary backed by TaskState.
 
@@ -343,7 +398,8 @@ class SessionManager:
         # ------------------------------------------------------------------
         # 1) Refresh TaskState with new facts + errors.
         # ------------------------------------------------------------------
-        state = TaskState.load(self._storage, chat_id, agent_id)
+        # Phase 9 P0.2: pass channel_name to TaskState
+        state = TaskState.load(self._storage, chat_id, agent_id, channel_name)
 
         new_facts = extract_facts_from_messages(compacted_messages)
         for fact in new_facts:
@@ -371,19 +427,41 @@ class SessionManager:
         # ------------------------------------------------------------------
         summary_text = self._build_summary_text(state, recent_errors)
         now = int(time.time())
-        self._storage.execute(
+        cursor = self._storage.execute(
             "INSERT INTO messages "
             "(chat_id, agent_id, run_id, role, content, created_at, "
-            "compacted, is_compaction_summary) "
-            "VALUES (?, ?, ?, 'system', ?, ?, 0, 1)",
-            (chat_id, agent_id, None, summary_text, now),
+            "compacted, is_compaction_summary, channel_name, workspace_dir, workspace_dir_inferred) "
+            "VALUES (?, ?, ?, 'system', ?, ?, 0, 1, ?, ?, ?)",
+            (chat_id, agent_id, None, summary_text, now, channel_name, workspace_dir, 0),
         )
+        message_id = cursor.lastrowid
+
+        # Phase 9 M9.1: mirror summary to messages_fts
+        if message_id and summary_text:
+            from mini_claw.chat_search.indexer import index_message_row
+            try:
+                session_id = derive_session_id(channel_name, chat_id, agent_id)
+                index_message_row(
+                    self._storage,
+                    message_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    chat_id=chat_id,
+                    channel_name=channel_name,
+                    workspace_dir=workspace_dir,
+                    role="system",
+                    content=summary_text,
+                    created_at=now,
+                )
+            except Exception:
+                pass
 
         # ------------------------------------------------------------------
         # 4) Persist TaskState and optionally collapse old summaries.
         # ------------------------------------------------------------------
-        state.save(self._storage, chat_id, agent_id)
-        self._merge_old_summaries_if_needed(chat_id, agent_id)
+        # Phase 9 P0.2: pass channel_name to TaskState.save
+        state.save(self._storage, chat_id, agent_id, channel_name)
+        self._merge_old_summaries_if_needed(chat_id, agent_id, channel_name, workspace_dir)
 
         return len(to_compact_ids)
 
@@ -458,7 +536,13 @@ class SessionManager:
 
         return "\n".join(lines)
 
-    def _merge_old_summaries_if_needed(self, chat_id: str, agent_id: str) -> None:
+    def _merge_old_summaries_if_needed(
+        self,
+        chat_id: str,
+        agent_id: str,
+        channel_name: str = "feishu",
+        workspace_dir: str | None = None,
+    ) -> None:
         """Roll up older summaries when more than ``_MAX_ACTIVE_SUMMARIES`` exist.
 
         We keep the most recent summary intact (callers rely on it for the
@@ -496,10 +580,31 @@ class SessionManager:
             tuple(merge_ids),
         )
         now = int(time.time())
-        self._storage.execute(
+        cursor = self._storage.execute(
             "INSERT INTO messages "
             "(chat_id, agent_id, run_id, role, content, created_at, "
-            "compacted, is_compaction_summary) "
-            "VALUES (?, ?, ?, 'system', ?, ?, 0, 1)",
-            (chat_id, agent_id, None, merged_text, now),
+            "compacted, is_compaction_summary, channel_name, workspace_dir, workspace_dir_inferred) "
+            "VALUES (?, ?, ?, 'system', ?, ?, 0, 1, ?, ?, ?)",
+            (chat_id, agent_id, None, merged_text, now, channel_name, workspace_dir, 0),
         )
+        message_id = cursor.lastrowid
+
+        # Phase 9 M9.1: mirror merged summary to messages_fts
+        if message_id and merged_text:
+            from mini_claw.chat_search.indexer import index_message_row
+            try:
+                session_id = derive_session_id(channel_name, chat_id, agent_id)
+                index_message_row(
+                    self._storage,
+                    message_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    chat_id=chat_id,
+                    channel_name=channel_name,
+                    workspace_dir=workspace_dir,
+                    role="system",
+                    content=merged_text,
+                    created_at=now,
+                )
+            except Exception:
+                pass

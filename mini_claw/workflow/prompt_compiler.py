@@ -26,6 +26,19 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)(token\s*[=:]\s*)[^\s,;]+"),
     re.compile(r"(?i)(password\s*[=:]\s*)[^\s,;]+"),
     re.compile(r"(?m)^([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*).+$"),
+    # Phase 9 M9.2: provider-style API keys (OpenAI/Stripe sk-..., GitHub gh*_...)
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{8,})"),
+    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"),
+    re.compile(r"\b(xox[abprs]-[A-Za-z0-9-]{10,})"),
+)
+
+
+# Phase 7: extra reviewer-only redaction patterns.
+_ABSOLUTE_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Posix-style absolute paths under /Users, /home, /tmp, /var, /private
+    re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home|root|tmp|var|private)/[^\s'\"]+"),
+    # Windows-style absolute paths (C:\..., D:\...)
+    re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:\\[^\s'\"]+"),
 )
 
 
@@ -36,6 +49,19 @@ def redact_prompt_text(text: str) -> tuple[str, bool]:
         output, count = pattern.subn(r"\1[REDACTED]", output)
         redacted = redacted or count > 0
     return output, redacted
+
+
+def redact_for_reviewer(text: str) -> str:
+    """Phase 7: stronger redaction applied before reviewer ingests upstream prompts.
+
+    Layers on top of :func:`redact_prompt_text` (defensive double-pass) and
+    additionally rewrites absolute filesystem paths to ``<workspace>/...`` so
+    the reviewer can't be tricked into exfiltrating the host directory layout.
+    """
+    text, _ = redact_prompt_text(text)
+    for pattern in _ABSOLUTE_PATH_PATTERNS:
+        text = pattern.sub("<workspace>/...", text)
+    return text
 
 
 class SubAgentPromptCompiler:
@@ -50,7 +76,12 @@ class SubAgentPromptCompiler:
         agent_allowed = set(agent_cfg.tools)
         role_allowed = set(profile.default_tools)
         effective = sorted(requested & agent_allowed & role_allowed)
-        if node.type == "subagent" and node.agent_role != "summarizer" and not effective:
+        no_tool_roles = {"summarizer", "prompt_reviewer"}
+        if (
+            node.type == "subagent"
+            and node.agent_role not in no_tool_roles
+            and not effective
+        ):
             raise WorkflowSpecError(f"node {node.id} has no effective tools")
         return effective
 
@@ -74,8 +105,24 @@ class SubAgentPromptCompiler:
             "Return valid JSON matching the output contract.",
         ]
 
-        deps_text = self._format_dependency_results(dependency_results)
+        deps_text = (
+            self._format_reviewer_inputs(dependency_results)
+            if node.agent_role == "prompt_reviewer"
+            else self._format_dependency_results(dependency_results)
+        )
         state_text = self._format_task_state(task_state)
+
+        # Phase 9 M9.5.3: workspace-memory hint for coding-type subagents
+        coding_roles = {"implementer", "tester", "security_reviewer"}
+        workspace_memory_hint = ""
+        if node.agent_role in coding_roles:
+            workspace_memory_hint = (
+                "\nWhen modifying code, debugging, or running tests, FIRST call "
+                "search_memory(scope='workspace') to surface project-level test "
+                "commands, prior bug root causes, and security/architecture "
+                "constraints. Workspace memories are project-specific and reflect "
+                "decisions made for this codebase only."
+            )
 
         system_prompt = "\n\n".join(
             [
@@ -94,7 +141,10 @@ class SubAgentPromptCompiler:
                 "## Tool Policy\n"
                 f"Allowed tools: {json.dumps(effective_tools, ensure_ascii=False)}\n"
                 f"Forbidden tools: {json.dumps(forbidden_tools, ensure_ascii=False)}\n"
-                "If you need a forbidden tool, set needs_escalation=true or needs_more_info=true in the JSON output.",
+                "If you need a forbidden tool, set needs_escalation=true or needs_more_info=true in the JSON output.\n"
+                "When dealing with long documents or large codebases, prefer search_context "
+                "over read_file. Only fall back to read_file for narrow, targeted reads."
+                + workspace_memory_hint,
                 "## Boundaries\n"
                 "You must not modify files unless write tools are explicitly allowed. "
                 "You must not assume files exist without reading or listing them. "
@@ -171,6 +221,33 @@ class SubAgentPromptCompiler:
             if result.artifacts:
                 lines.append(f"  artifacts={json.dumps(result.artifacts, ensure_ascii=False)[:2000]}")
         return "\n".join(lines)
+
+    def _format_reviewer_inputs(self, dependency_results: dict[str, WorkflowNodeResult]) -> str:
+        """Phase 7: format upstream compiled prompts for the reviewer subagent.
+
+        Looks for ``compiled_prompt`` artifact (written by WorkflowRunner) on each
+        upstream node, applies reviewer-grade redaction, and truncates per-node
+        text so the reviewer prompt cannot exceed ``max_prompt_chars``.
+        """
+        if not dependency_results:
+            return "- none"
+        budget = max(800, self._workflow_config.max_prompt_chars - 4000)
+        per_node = max(400, budget // max(1, len(dependency_results)) - 200)
+
+        lines: list[str] = ["## Upstream Compiled Prompts"]
+        for node_id, result in dependency_results.items():
+            artifacts = result.artifacts or {}
+            compiled = artifacts.get("compiled_prompt")
+            if not compiled:
+                lines.append(f"### {node_id}\n[no compiled prompt available]")
+                continue
+            sys_text = redact_for_reviewer(str(compiled.get("system_prompt", "")))
+            user_text = redact_for_reviewer(str(compiled.get("user_prompt", "")))
+            combined = f"[system]\n{sys_text}\n\n[user]\n{user_text}"
+            if len(combined) > per_node:
+                combined = combined[:per_node] + "\n... [truncated]"
+            lines.append(f"### {node_id}\n{combined}")
+        return "\n\n".join(lines)
 
     def _format_task_state(self, task_state: TaskState) -> str:
         return json.dumps(

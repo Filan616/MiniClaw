@@ -19,7 +19,7 @@ ROLE_PROFILES: dict[str, RoleProfile] = {
     "researcher": RoleProfile(
         name="researcher",
         mission_style="Investigate facts and report evidence. Do not modify files.",
-        default_tools=["read_file", "list_directory"],
+        default_tools=["read_file", "list_directory", "search_context", "list_contexts", "inspect_context"],
         forbidden_tools=["write_file", "run_shell"],
         output_schema={
             "summary": "string",
@@ -30,7 +30,7 @@ ROLE_PROFILES: dict[str, RoleProfile] = {
     "planner": RoleProfile(
         name="planner",
         mission_style="Create an implementation plan. Do not execute changes.",
-        default_tools=["read_file", "list_directory"],
+        default_tools=["read_file", "list_directory", "search_context", "list_contexts"],
         forbidden_tools=["write_file", "run_shell"],
         output_schema={
             "summary": "string",
@@ -41,7 +41,7 @@ ROLE_PROFILES: dict[str, RoleProfile] = {
     "implementer": RoleProfile(
         name="implementer",
         mission_style="Make minimal changes according to an approved plan.",
-        default_tools=["read_file", "write_file"],
+        default_tools=["read_file", "write_file", "search_context"],
         forbidden_tools=[],
         output_schema={
             "summary": "string",
@@ -53,7 +53,7 @@ ROLE_PROFILES: dict[str, RoleProfile] = {
     "tester": RoleProfile(
         name="tester",
         mission_style="Run or inspect tests and explain failures. Do not modify files.",
-        default_tools=["run_shell", "read_file", "list_directory"],
+        default_tools=["run_shell", "read_file", "list_directory", "search_context"],
         forbidden_tools=["write_file"],
         output_schema={
             "summary": "string",
@@ -64,7 +64,7 @@ ROLE_PROFILES: dict[str, RoleProfile] = {
     "security_reviewer": RoleProfile(
         name="security_reviewer",
         mission_style="Audit security boundaries. Do not modify files.",
-        default_tools=["read_file", "list_directory"],
+        default_tools=["read_file", "list_directory", "search_context", "list_contexts", "inspect_context"],
         forbidden_tools=["write_file", "run_shell"],
         output_schema={
             "summary": "string",

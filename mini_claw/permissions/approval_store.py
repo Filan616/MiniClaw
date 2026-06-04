@@ -42,6 +42,7 @@ class ApprovalStore:
         tool_args: dict,
         expires_at: int,
         approval_type: str = "tool",
+        channel_name: str = "legacy",
     ) -> None:
         """Create a pending approval record.
 
@@ -53,12 +54,14 @@ class ApprovalStore:
             tool_name: name of the tool requiring approval
             tool_args: tool arguments as dict
             expires_at: unix timestamp when this approval expires
+            approval_type: type of approval (tool/memory_export_full/etc.)
+            channel_name: Phase 9 P0.2 — channel for multi-channel isolation
         """
         now = int(time.time())
         self._storage.execute(
             "INSERT INTO pending_approvals "
-            "(id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            "(id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, channel_name, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
             (
                 approval_id,
                 run_id,
@@ -67,26 +70,40 @@ class ApprovalStore:
                 tool_name,
                 json.dumps(tool_args),
                 approval_type,
+                channel_name,
                 now,
                 expires_at,
             ),
         )
 
-    def resolve_pending(self, approval_id: str, decision: str) -> Optional[dict[str, Any]]:
+    def resolve_pending(
+        self,
+        approval_id: str,
+        decision: str,
+        channel_name: str | None = None,
+    ) -> Optional[dict[str, Any]]:
         """Resolve a pending approval.
 
         Args:
             approval_id: ID of the approval to resolve
             decision: one of "approved", "rejected", "expired"
+            channel_name: Phase 9 P0.4 — if provided, verify approval belongs to channel (strict isolation)
 
         Returns:
             The resolved record as dict, or None if not found / already resolved.
         """
-        record = self._storage.fetchone(
-            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, expires_at "
-            "FROM pending_approvals WHERE id = ?",
-            (approval_id,),
-        )
+        if channel_name is not None:
+            record = self._storage.fetchone(
+                "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, channel_name, expires_at "
+                "FROM pending_approvals WHERE id = ? AND channel_name = ?",
+                (approval_id, channel_name),
+            )
+        else:
+            record = self._storage.fetchone(
+                "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, channel_name, expires_at "
+                "FROM pending_approvals WHERE id = ?",
+                (approval_id,),
+            )
         if record is None or record["status"] != "pending":
             return None
 
@@ -112,19 +129,35 @@ class ApprovalStore:
             "chat_id": record["chat_id"],
             "agent_id": record["agent_id"],
             "approval_type": record.get("approval_type") or "tool",
+            "channel_name": record.get("channel_name"),
         }
 
-    def get_pending(self, approval_id: str) -> Optional[dict[str, Any]]:
+    def get_pending(
+        self,
+        approval_id: str,
+        channel_name: str | None = None,
+    ) -> Optional[dict[str, Any]]:
         """Get a pending approval record by ID.
+
+        Args:
+            approval_id: ID of the approval
+            channel_name: Phase 9 P0.4 — if provided, verify approval belongs to channel (strict isolation)
 
         Returns:
             The record as dict, or None if not found.
         """
-        record = self._storage.fetchone(
-            "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, created_at, expires_at "
-            "FROM pending_approvals WHERE id = ?",
-            (approval_id,),
-        )
+        if channel_name is not None:
+            record = self._storage.fetchone(
+                "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, channel_name, created_at, expires_at "
+                "FROM pending_approvals WHERE id = ? AND channel_name = ?",
+                (approval_id, channel_name),
+            )
+        else:
+            record = self._storage.fetchone(
+                "SELECT id, run_id, chat_id, agent_id, tool_name, tool_args, status, approval_type, channel_name, created_at, expires_at "
+                "FROM pending_approvals WHERE id = ?",
+                (approval_id,),
+            )
         if record is None:
             return None
 
@@ -137,6 +170,7 @@ class ApprovalStore:
             "tool_args": json.loads(record["tool_args"]),
             "status": record["status"],
             "approval_type": record.get("approval_type") or "tool",
+            "channel_name": record.get("channel_name"),
             "created_at": record["created_at"],
             "expires_at": record["expires_at"],
         }

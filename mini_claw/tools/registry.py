@@ -41,6 +41,10 @@ class ToolContext:
     sandbox_mode: str = "safe"  # "safe" or "bypass"
     audit_logger: Any = None  # SecurityAuditLogger instance (TYPE_CHECKING avoided for simplicity)
     chain_detector: Any = None  # ChainDetector instance
+    rag_manager: Any = None  # Phase 8 M2: RagManager instance
+    session_id: str | None = None  # Phase 8 M2: for RAG scope filtering
+    channel_name: str | None = None  # Phase 8 M2: for RAG audit
+    chat_search_manager: Any = None  # Phase 9 M9.1: ChatSearchManager instance
 
 
 class ToolRegistry:

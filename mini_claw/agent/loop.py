@@ -682,6 +682,11 @@ async def run_agent_step(
 
     # Max iterations reached
     run.status = RunOutcome.ABORTED
+    run.final_answer = (
+        f"抱歉，我在 {MAX_ITERATIONS} 轮对话后仍未能完成任务。"
+        "这可能是因为任务过于复杂，或者遇到了重复的工具调用问题。"
+        "请尝试简化您的请求，或将任务拆分成更小的步骤。"
+    )
     return run
 
 

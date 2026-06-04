@@ -103,6 +103,10 @@ async def test_agent_loop_max_iterations(
     )
     assert result.status == RunOutcome.ABORTED
     assert result.iterations == MAX_ITERATIONS
+    # Phase 9 fix: ensure ABORTED runs have a meaningful final_answer
+    assert result.final_answer is not None
+    assert "轮对话" in result.final_answer or "iterations" in result.final_answer.lower()
+    assert len(result.final_answer) > 20  # Not empty or trivial
 
 
 @pytest.mark.asyncio

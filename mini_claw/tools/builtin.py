@@ -31,8 +31,16 @@ def _obfuscate_path_escape(original_path: str, exc: ValueError, *, ctx: ToolCont
             chat_id=ctx.chat_id,
             agent_id=ctx.agent_id,
         )
-        return f"[ERROR] Path outside workspace. debug_id={debug_id}"
-    return "[ERROR] Path outside workspace"
+        return (
+            f"[ERROR] Path outside workspace. The requested file is not accessible "
+            f"because it's outside the allowed workspace directory. "
+            f"Only files within the workspace can be read. debug_id={debug_id}"
+        )
+    return (
+        "[ERROR] Path outside workspace. The requested file is not accessible "
+        "because it's outside the allowed workspace directory. "
+        "Only files within the workspace can be read."
+    )
 
 
 def _obfuscate_sensitive_path(original_path: str, exc: ValueError, *, ctx: ToolContext) -> str:

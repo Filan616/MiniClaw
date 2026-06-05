@@ -46,7 +46,12 @@ class WorkspaceManager:
                 route_chat_ids=list(agent_cfg.route_chat_ids),
             )
             if self._base_dir is not None:
-                ws.workspace_dir = self._base_dir / (agent_cfg.workspace or agent_cfg.id)
+                # Phase 9 fix: resolve() to normalize paths like "../.." into
+                # absolute canonical form. Without this, workspace_dir gets
+                # stored as "D:\...\workspaces\..\.." which fails string-equal
+                # comparisons against properly resolved paths in RAG scope checks.
+                raw_path = self._base_dir / (agent_cfg.workspace or agent_cfg.id)
+                ws.workspace_dir = raw_path.resolve()
                 ws.workspace_dir.mkdir(parents=True, exist_ok=True)
             self._workspaces[ws.agent_id] = ws
 

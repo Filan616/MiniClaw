@@ -9,26 +9,50 @@
 ## 快速开始
 
 ```bash
-# 1. 安装（默认 zero 向量依赖）
-pip install -e .
+# 1. 克隆仓库
+git clone <repo-url>
+cd MiniClaw
 
-# 2. 在当前目录生成 config.yaml（也可以 --config 指定其它路径）
+# 2. 安装依赖（基础版，不含向量检索和代码锚点）
+pip install -r requirements.txt
+
+# 或者安装完整版（包含所有可选功能）
+pip install -r requirements-full.txt
+playwright install chromium  # 浏览器自动化
+
+# 或者使用 pip install -e 方式（推荐开发）
+pip install -e .                           # 基础
+pip install -e '.[rag-vector]'             # + 向量检索
+pip install -e '.[rag-code]'               # + 代码锚点
+pip install -e '.[browser,rag-vector,rag-code,dev]'  # 全功能
+
+# 3. 在当前目录生成 config.yaml（也可以 --config 指定其它路径）
 mini-claw setup
 
-# 3. 自检
+# 4. 自检
 mini-claw doctor
 
-# 4. 本地 CLI 对话（走 Gateway，与飞书同一套权限/审计/会话）
+# 5. 本地 CLI 对话（走 Gateway，与飞书同一套权限/审计/会话）
 mini-claw chat
 
-# 5. 启动服务（飞书长连接模式，无需公网域名）
+# 6. 启动服务（飞书长连接模式，无需公网域名）
 mini-claw run
-
-# 6.（可选）启用 Phase 8 向量检索，需安装额外依赖
-pip install -e ".[rag-vector]"     # chromadb + sentence-transformers
 ```
 
+**依赖说明**：
+
+| 文件 | 用途 | 包含内容 |
+|---|---|---|
+| `requirements.txt` | 基础安装 | 核心依赖（飞书、OpenAI、FastAPI 等），可选依赖注释掉 |
+| `requirements-full.txt` | 完整功能 | 所有依赖（核心 + 向量 + 代码锚点 + 浏览器 + 测试） |
+| `requirements-dev.txt` | 开发环境 | 核心 + 测试，向量/代码功能按需安装 |
+
 飞书走 WebSocket 长连接：在 `config.yaml` 把 `channels` 中 feishu 的 `enabled` 设为 `true` 并填入 `app_id` / `app_secret` 即可，不需要 Webhook URL 或加密 Key。
+
+**常见问题**：
+
+- 如果遇到 `sentence-transformers not installed` 错误：安装 `pip install -e '.[rag-vector]'` 或在 `config.yaml` 设置 `rag.embedding.enabled: false`
+- 如果遇到 `tree-sitter` 相关错误：安装 `pip install -e '.[rag-code]'` 或不使用 `/context reindex <id> --incremental`
 
 ## 架构
 

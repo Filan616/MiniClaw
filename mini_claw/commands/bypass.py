@@ -59,6 +59,7 @@ def handle_bypass_command(
     chat_id: str,
     agent_id: str,
     text: str,
+    channel_name: str = "feishu",
 ) -> BypassResult | None:
     """Dispatch a /bypass ... message.
 
@@ -74,7 +75,7 @@ def handle_bypass_command(
 
     # /bypass or /bypass next -> single-use bypass
     if arg in ("", "next"):
-        _set_bypass_single_use(storage, chat_id, agent_id)
+        _set_bypass_single_use(storage, chat_id, agent_id, channel_name)
         return BypassResult("Bypass enabled for next tool only")
 
     # /bypass persistent -> stage a confirmation request
@@ -83,6 +84,7 @@ def handle_bypass_command(
             storage,
             chat_id,
             agent_id,
+            channel_name,
             "bypass_persistent",
             ttl_seconds=PERSISTENT_CONFIRM_TTL_SECONDS,
         )
@@ -93,12 +95,12 @@ def handle_bypass_command(
     # /bypass confirm -> commit persistent bypass if a fresh request exists
     if arg == "confirm":
         if not _consume_pending_confirmation(
-            storage, chat_id, agent_id, "bypass_persistent"
+            storage, chat_id, agent_id, channel_name, "bypass_persistent"
         ):
             return BypassResult(
                 "No pending bypass confirmation. Send /bypass persistent first."
             )
-        _set_bypass_persistent(storage, chat_id, agent_id)
+        _set_bypass_persistent(storage, chat_id, agent_id, channel_name)
         return BypassResult("Persistent bypass enabled (no expiration)")
 
     # /bypass <duration>
@@ -113,7 +115,7 @@ def handle_bypass_command(
                 f"Duration too long. Maximum is {MAX_TTL_SECONDS // 3600} hours."
             )
         expires_at = int(time.time()) + duration
-        _set_bypass_ttl(storage, chat_id, agent_id, expires_at)
+        _set_bypass_ttl(storage, chat_id, agent_id, channel_name, expires_at)
         return BypassResult(
             f"Bypass enabled for {_format_duration_human(duration)} "
             f"(until {_format_until(expires_at)})"
@@ -167,7 +169,7 @@ def _format_duration_human(seconds: int) -> str:
 
 
 def _set_bypass_single_use(
-    storage: "Database", chat_id: str, agent_id: str
+    storage: "Database", chat_id: str, agent_id: str, channel_name: str
 ) -> None:
     """Activate single-use bypass via expires_at=0 sentinel + single_use flag."""
     storage.execute(
@@ -177,13 +179,17 @@ def _set_bypass_single_use(
         "sandbox_mode_single_use=1, "
         "sandbox_mode_persistent=0, "
         "updated_at=? "
-        "WHERE chat_id=? AND agent_id=?",
-        (SINGLE_USE_SENTINEL, int(time.time()), chat_id, agent_id),
+        "WHERE channel_name=? AND chat_id=? AND agent_id=?",
+        (SINGLE_USE_SENTINEL, int(time.time()), channel_name, chat_id, agent_id),
     )
 
 
 def _set_bypass_ttl(
-    storage: "Database", chat_id: str, agent_id: str, expires_at: int
+    storage: "Database",
+    chat_id: str,
+    agent_id: str,
+    channel_name: str,
+    expires_at: int,
 ) -> None:
     """Activate TTL-bound bypass that auto-expires at the given epoch."""
     storage.execute(
@@ -193,13 +199,13 @@ def _set_bypass_ttl(
         "sandbox_mode_single_use=0, "
         "sandbox_mode_persistent=0, "
         "updated_at=? "
-        "WHERE chat_id=? AND agent_id=?",
-        (expires_at, int(time.time()), chat_id, agent_id),
+        "WHERE channel_name=? AND chat_id=? AND agent_id=?",
+        (expires_at, int(time.time()), channel_name, chat_id, agent_id),
     )
 
 
 def _set_bypass_persistent(
-    storage: "Database", chat_id: str, agent_id: str
+    storage: "Database", chat_id: str, agent_id: str, channel_name: str
 ) -> None:
     """Activate persistent bypass: NULL expires_at + persistent flag."""
     storage.execute(
@@ -209,8 +215,8 @@ def _set_bypass_persistent(
         "sandbox_mode_single_use=0, "
         "sandbox_mode_persistent=1, "
         "updated_at=? "
-        "WHERE chat_id=? AND agent_id=?",
-        (int(time.time()), chat_id, agent_id),
+        "WHERE channel_name=? AND chat_id=? AND agent_id=?",
+        (int(time.time()), channel_name, chat_id, agent_id),
     )
 
 
@@ -218,6 +224,7 @@ def _create_pending_confirmation(
     storage: "Database",
     chat_id: str,
     agent_id: str,
+    channel_name: str,
     type_: str,
     ttl_seconds: int,
 ) -> None:
@@ -226,9 +233,9 @@ def _create_pending_confirmation(
     expires_at = now + ttl_seconds
     storage.execute(
         "INSERT OR REPLACE INTO pending_confirmations "
-        "(chat_id, agent_id, type, expires_at, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (chat_id, agent_id, type_, expires_at, now),
+        "(channel_name, chat_id, agent_id, type, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (channel_name, chat_id, agent_id, type_, expires_at, now),
     )
 
 
@@ -236,6 +243,7 @@ def _consume_pending_confirmation(
     storage: "Database",
     chat_id: str,
     agent_id: str,
+    channel_name: str,
     type_: str,
 ) -> bool:
     """Atomically check + delete a pending confirmation.
@@ -246,16 +254,16 @@ def _consume_pending_confirmation(
     now = int(time.time())
     row = storage.fetchone(
         "SELECT expires_at FROM pending_confirmations "
-        "WHERE chat_id=? AND agent_id=? AND type=?",
-        (chat_id, agent_id, type_),
+        "WHERE channel_name=? AND chat_id=? AND agent_id=? AND type=?",
+        (channel_name, chat_id, agent_id, type_),
     )
     if row is None:
         return False
 
     storage.execute(
         "DELETE FROM pending_confirmations "
-        "WHERE chat_id=? AND agent_id=? AND type=?",
-        (chat_id, agent_id, type_),
+        "WHERE channel_name=? AND chat_id=? AND agent_id=? AND type=?",
+        (channel_name, chat_id, agent_id, type_),
     )
 
     return int(row["expires_at"]) >= now

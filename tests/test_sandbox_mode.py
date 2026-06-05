@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_claw.config import PermissionsConfig
+from mini_claw.config import PermissionsConfig, RagConfig
 from mini_claw.permissions.gate import PermissionGate
 from mini_claw.permissions.policy import PermissionPolicy
 from mini_claw.tools.builtin import (
@@ -54,6 +54,40 @@ def test_bypass_mode_allows_outside_read(workspace, outside_file):
     ctx = ToolContext(workspace_dir=workspace, sandbox_mode="bypass")
     result = asyncio.run(TOOL_READ_FILE.handler(path=str(outside_file), ctx=ctx))
     assert result == "outside content"
+
+
+class _FakeRagManager:
+    def __init__(self, *, min_chars: int = 20) -> None:
+        self.config = RagConfig()
+        self.config.enabled = True
+        self.config.namespaces.context_enabled = True
+        self.config.auto_index.enabled = True
+        self.config.auto_index.min_chars = min_chars
+        self.indexed_paths: list[str] = []
+
+    def index_context(self, path: str, *, ctx, title=None):
+        self.indexed_paths.append(path)
+        return "item-auto", ""
+
+
+def test_read_file_auto_indexes_only_above_threshold(workspace):
+    short_file = workspace / "short.md"
+    long_file = workspace / "long.md"
+    short_file.write_text("short text", encoding="utf-8")
+    long_file.write_text("long text " * 10, encoding="utf-8")
+    rag_manager = _FakeRagManager(min_chars=20)
+    ctx = ToolContext(
+        workspace_dir=workspace,
+        sandbox_mode="safe",
+        rag_manager=rag_manager,
+    )
+
+    short_result = asyncio.run(TOOL_READ_FILE.handler(path="short.md", ctx=ctx))
+    long_result = asyncio.run(TOOL_READ_FILE.handler(path="long.md", ctx=ctx))
+
+    assert "RAG auto-index" not in short_result
+    assert "[RAG auto-indexed: item_id=item-auto]" in long_result
+    assert rag_manager.indexed_paths == [str(long_file.resolve())]
 
 
 def test_safe_mode_blocks_sensitive_inside_workspace(workspace):

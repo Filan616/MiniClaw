@@ -5,7 +5,13 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from mini_claw.agent.loop import AgentRun, RunOutcome, run_agent_step, MAX_ITERATIONS
+from mini_claw.agent.loop import (
+    AgentRun,
+    RunOutcome,
+    _messages_for_provider,
+    run_agent_step,
+    MAX_ITERATIONS,
+)
 from mini_claw.agent.context import AgentContext
 from mini_claw.providers.base import LLMResponse, ToolCall
 from mini_claw.permissions.gate import Decision
@@ -65,6 +71,15 @@ def ctx():
     )
 
 
+def test_messages_include_current_time_context(agent_run, ctx):
+    messages = _messages_for_provider(agent_run, ctx)
+
+    assert messages[0]["role"] == "system"
+    assert "[Current Time]" in messages[0]["content"]
+    assert "current_time" in messages[0]["content"]
+    assert "日报" in messages[0]["content"]
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_converges(
     agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
@@ -80,6 +95,30 @@ async def test_agent_loop_converges(
     )
     assert result.status == RunOutcome.DONE
     assert result.final_answer == "Here are the files in the directory."
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_disables_streaming_when_tools_available(
+    agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
+):
+    """Tool calls should use non-streaming completions so arguments arrive intact."""
+    ctx.channel.send_stream_chunk = AsyncMock()
+    mock_provider.chat.return_value = LLMResponse(
+        text="Done",
+        tool_calls=[],
+        finish_reason="stop",
+        raw={},
+    )
+
+    result = await run_agent_step(
+        agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
+    )
+
+    assert result.status == RunOutcome.DONE
+    _, kwargs = mock_provider.chat.call_args
+    assert kwargs["tools"] is not None
+    assert kwargs["stream"] is False
+    assert kwargs["stream_callback"] is None
 
 
 @pytest.mark.asyncio

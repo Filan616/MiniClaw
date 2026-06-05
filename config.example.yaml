@@ -1,57 +1,425 @@
-# Mini-Claw 默认配置文件
-# 复制此文件到当前目录的 config.yaml 并填入你的配置
+# Mini-Claw 完整配置示例
+# 复制此文件为 config.yaml，并填入你自己的 API key / app_secret。
+# 注意：config.yaml 通常包含密钥，必须加入 .gitignore，不要提交。
 
+# ============================================================
+# Provider：默认 LLM
+# ============================================================
 provider:
-  provider: deepseek
+  provider: deepseek          # deepseek | openai | ollama
   api_key: "sk-your-api-key-here"
   model: deepseek-chat
-  # base_url: ""   # 自定义 API 地址（可选）
+  base_url: null              # 自定义 OpenAI-compatible 地址；不需要则 null
 
+# ============================================================
+# Feishu Channel：长连接模式
+# ============================================================
 channels_feishu:
-  # 长连接（WebSocket）模式：只需 app_id / app_secret，
-  # 无需 Webhook URL、verification_token 或 encrypt_key。
   enabled: false
   app_id: "cli_xxx"
   app_secret: "your-app-secret"
 
+# 新版多通道配置。若留空，load_config 会根据 channels_feishu 自动生成 feishu channel。
+channels:
+  - name: feishu
+    type: feishu
+    enabled: false
+    options:
+      app_id: "cli_xxx"
+      app_secret: "your-app-secret"
+
+# ============================================================
+# HTTP Server
+# ============================================================
 server:
   host: 0.0.0.0
   port: 8000
   public_url: "https://your-host.example.com"
 
+# ============================================================
+# Permissions / Sandbox / ChainDetector
+# ============================================================
 permissions:
   default_level: L2
-  # sandbox_mode: "safe"   = 路径限制在 workspace 内 + 敏感文件拦截（推荐）
-  #                "bypass" = 关闭沙箱，agent 可读写整台电脑（仅在你完全信任时使用）
+
+  # safe   = 路径限制在 workspace 内 + 敏感文件拦截（推荐）
+  # bypass = 关闭路径沙箱，agent 可读写整台电脑（仅完全信任时使用）
   # bash 黑名单不论模式都生效，作为最后一道安全网。
   sandbox_mode: safe
+
   require_confirm:
     - L3
   deny_by_default:
     - L4
+
+  # 正则使用 re.search。这里列出默认黑名单，项目配置可按需裁剪。
   shell_blacklist:
-    - 'rm\s+-rf\s+/'
-    - 'mkfs'
-    - ':\(\)\{'
+    - '\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+/(?:\s|$)'
+    - '\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+~(?:/|\s|$)'
+    - '\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+\$HOME\b'
+    - '\brm\s+(?:-[rRfv]+\s+|--recursive\s+|--force\s+)+/\*'
+    - '\bmkfs(?:\.|\s)'
+    - '\bdd\s+if='
+    - ':\(\)\s*\{'
+    - '\bshred\s+-'
+    - '\bswapoff\s+-a\b'
+    - '\bfind\b[^|;&]*\s-delete\b'
+    - '\bfind\b[^|;&]*-exec\s+rm\b'
+    - '\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b'
+    - '\bwget\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b'
+    - '\bfetch\b[^|]*\|\s*(?:ba)?sh\b'
+    - '\bbash\s+-c\b'
+    - '\bsh\s+-c\b'
+    - '\bzsh\s+-c\b'
+    - '\bpython3?\s+-c\b'
+    - '\bnode\s+-e\b'
+    - '\bperl\s+-e\b'
+    - '\bruby\s+-e\b'
+    - '\bphp\s+-r\b'
+    - '\bbase64\s+(?:-d|--decode)\b[^|]*\|\s*(?:ba)?sh\b'
+    - '\bxxd\s+-r\b[^|]*\|\s*(?:ba)?sh\b'
+    - '\bopenssl\s+enc\s+-d\b[^|]*\|\s*(?:ba)?sh\b'
+    - '\beval\s+["'']?\$\(\s*curl\b'
+    - '\beval\s+["'']?\$\(\s*wget\b'
+    - '`\s*curl\b'
+    - '`\s*wget\b'
+    - '>\s*~/\.ssh/'
+    - '>\s*\$HOME/\.ssh/'
+    - '>\s*/etc/passwd\b'
+    - '>\s*/etc/shadow\b'
+    - '>\s*/etc/sudoers\b'
+    - '(?i)\bpowershell(?:\.exe)?\s+(?:-|/)e(?:nc(?:odedcommand)?)?\b'
+    - '(?i)\bpowershell(?:\.exe)?\s+(?:-|/)c(?:ommand)?\b'
+    - '(?i)\b(?:iex|Invoke-Expression)\b'
+    - '(?i)\bDownloadString\s*\('
+    - '(?i)\biwr\b[^|]*\|\s*iex\b'
+
   high_risk:
     allow_explicit: false
     allowed_command_templates: []
 
+  chain_detector:
+    enabled: true
+    session_scope: false       # true 后跨消息追踪攻击链
+    session_ttl: 604800        # 7 days
+
+# ============================================================
+# Workflow：手动 /workflow plan|run 编排
+# ============================================================
+workflow:
+  enabled: false
+  auto_detect: false           # 建议默认 false；普通消息走普通 AgentLoop
+  require_approval: true
+  max_nodes_per_workflow: 8
+  max_parallel_nodes: 3
+  max_total_agent_runs: 12
+  allow_dynamic: false
+  allow_llm_generated_script: false
+  max_prompt_chars: 12000
+
+  templates:
+    debug_fix:
+      enabled: true
+    code_review:
+      enabled: true
+    migration:
+      enabled: true
+
+  risk_policy:
+    write_file: approval
+    run_shell: approval
+    dynamic_workflow: approval
+
+  auto_detect_options:
+    min_chars: 80
+    max_chars: 500
+    llm_timeout_ms: 4000
+
+  prompt_review:
+    enabled: true
+    severity_threshold: medium # low | medium | high
+    node_id: prompt_review
+    timeout: 180
+
+# ============================================================
+# Concurrency：单进程/多进程锁
+# ============================================================
+concurrency:
+  lock_backend: asyncio        # asyncio | file | sqlite
+  cache_mode: memory           # memory | db
+  file_lock_dir: ./data/locks
+  lock_timeout: 30.0
+
+# ============================================================
+# Plugins
+# ============================================================
+plugins:
+  integrity_mode: strict       # strict | warn
+
+# ============================================================
+# RAG：Context RAG + Memory RAG
+# ============================================================
+rag:
+  enabled: false               # 开启 RAG 总开关
+
+  namespaces:
+    context_enabled: false     # context/doc/code RAG 工具注册
+    memory_enabled: false      # memory 工具注册
+
+  backend:
+    text_search: fts5          # fts5 | like
+    vector_backend: none       # none | chroma | milvus | sqlite_vec
+    hybrid_enabled: false
+
+  fts:
+    enabled: true
+    top_k: 8
+
+  embedding:
+    enabled: false
+    provider: local            # local | openai | custom
+    model: sentence-transformers/all-MiniLM-L6-v2
+    dim: 384
+    batch_size: 32
+
+  chroma:
+    persist_dir: ./data/chroma
+    collection_prefix: miniclaw
+
+  milvus:
+    enabled: false
+    uri: http://127.0.0.1:19530
+    collection_prefix: miniclaw
+
+  chunk:
+    max_tokens: 800
+    overlap_tokens: 100
+    max_file_size_mb: 20
+    binary_file_policy: deny   # deny | allow
+
+  security:
+    allow_index_in_bypass: false
+    allow_sensitive_index: false
+    require_approval_for_index: false
+    require_approval_for_sensitive_index: true
+    require_approval_for_memory_write: true
+
+  sharing:
+    allow_workspace_context_sharing: false
+    allow_cross_agent_context: false
+
+  retrieval:
+    # 自动注入默认关闭；建议先用 /context search、/memory search、/chat search 调试。
+    auto_context_retrieval: false
+    auto_memory_retrieval: false             # legacy alias
+    auto_chat_retrieval: false
+    auto_user_memory_retrieval: false
+    auto_workspace_memory_retrieval: false
+    context_top_k: 6
+    memory_top_k: 3
+    chat_top_k: 5
+    min_memory_confidence: 0.75
+    include_archived_by_default: false
+
+  lifecycle:
+    warm_after_days: 7
+    archive_after_days: 30
+    cold_after_days: 90
+    delete_after_days: 180
+    log_ttl_days: 7
+    keep_tombstone: true
+
+  auto_index:
+    enabled: false
+    min_chars: 20000
+    max_file_size_mb: 5
+    require_non_sensitive: true
+
+  reindex:
+    chunker_version: chunker.v1
+    anchor_schema_version: anchor.v1
+    code_anchor_backend: tree_sitter
+    rename_similarity_threshold: 0.88
+    uncertain_similarity_threshold: 0.72
+    parse_error_ratio_threshold: 0.20
+    lock_ttl_seconds: 600
+
+  # 兼容旧运行路径：top-level memory 会同步覆盖这两个块。
+  memory_control:
+    allow_hard_delete: false
+    max_batch_approve: 20
+    batch_approve_max: 20
+    max_batch_reject: 20
+    export_redact_by_default: true
+    auto_candidate: true
+    auto_write: false
+    require_approval: true
+    allow_export: true
+    allow_clear_scope: true
+    auto_candidate_from_agent: false
+    export_large_threshold: 50
+
+  memory_maintenance:
+    enabled: true
+    dupe_threshold: 0.85
+    conflict_threshold: 0.55
+    stale_age_days: 90
+    stale_max_access: 1
+    auto_apply: false
+    auto_run_on_compaction: false
+    run_every_days: 7
+    suggest_only: true
+    run_on_startup: false
+    dedupe_text_threshold: 0.85
+    dedupe_embedding_threshold: 0.92
+    mode: auto                 # auto | text_only | hybrid
+
+# ============================================================
+# Chat Search：messages 原文搜索
+# ============================================================
+chat_search:
+  enabled: false
+  allow_global: false
+  fts_max_results: 50
+  include_inferred: false
+
+# ============================================================
+# Memory：Phase 9 顶层配置
+# load_config 会同步到 rag.memory_control / rag.memory_maintenance
+# ============================================================
+memory:
+  control:
+    allow_hard_delete: false
+    max_batch_approve: 20
+    batch_approve_max: 20
+    max_batch_reject: 20
+    export_redact_by_default: true
+    auto_candidate: true
+    auto_write: false
+    require_approval: true
+    allow_export: true
+    allow_clear_scope: true
+    auto_candidate_from_agent: false
+    export_large_threshold: 50
+
+  maintenance:
+    enabled: true
+    dupe_threshold: 0.85
+    conflict_threshold: 0.55
+    stale_age_days: 90
+    stale_max_access: 1
+    auto_apply: false
+    auto_run_on_compaction: false
+    run_every_days: 7
+    suggest_only: true
+    run_on_startup: false
+    dedupe_text_threshold: 0.85
+    dedupe_embedding_threshold: 0.92
+    mode: auto
+
+# ============================================================
+# Agent defaults：会合并到每个 agents 条目，单个 agent 可覆盖
+# ============================================================
+agents_defaults:
+  enabled: true
+  tools:
+    - run_shell
+    - read_file
+    - write_file
+    - list_directory
+    - current_time
+    - open_app
+  skills: []
+
+# ============================================================
+# Agents
+# ============================================================
 agents:
   - id: default
+    name: Default Assistant
+    enabled: true
     system_prompt: "你是一个高效的个人助手，能调用工具帮用户完成各种任务。请用中文回复。"
+    workspace: default
+    model: null
+    provider: null
+    provider_fallback: []
+    skills: []
+    route_chat_ids: []
+    tools:
+      # Built-in tools
+      - run_shell
+      - read_file
+      - write_file
+      - list_directory
+      - current_time
+      - open_app
+
+      # 若在 app 中注册了 http_request，可打开；默认示例保留注释，避免未知工具。
+      # - http_request
+
+      # Context RAG tools：需 rag.enabled=true 且 rag.namespaces.context_enabled=true
+      # - index_context
+      # - search_context
+      # - list_contexts
+      # - inspect_context
+      # - clear_context
+      # - archive_context
+      # - delete_context
+      # - read_sensitive_context
+      # - reindex_context
+      # - diff_context
+      # - reembed_context
+      # - rebind_context
+      # - rag_status
+
+      # Memory RAG tools：需 rag.enabled=true 且 rag.namespaces.memory_enabled=true
+      # - memory_remember
+      # - memory_search
+      # - memory_list
+      # - memory_inspect
+      # - memory_delete
+      # - memory_pin
+      # - memory_unpin
+      # - memory_compact_to_rag
+
+      # Chat Search tool：需 chat_search.enabled=true
+      # - search_chat
+
+  # 示例：启用 RAG/Memory/Chat Search 后可使用的开发助手
+  - id: dev-assistant
+    name: Dev Assistant
+    enabled: false
+    system_prompt: "你是 MiniClaw 项目的开发助手。优先使用 RAG 和 workspace memory 检索项目事实，再回答。"
+    workspace: ../..
+    route_chat_ids: []
+    skills: []
+    provider:
+      provider: deepseek
+      api_key: "sk-your-api-key-here"
+      model: deepseek-chat
+      base_url: null
+    provider_fallback: []
     tools:
       - run_shell
       - read_file
       - write_file
       - list_directory
-      - http_request
-
-  # 示例：运维专用 agent
-  # - id: ops
-  #   system_prompt: "你是运维专家，只做服务器运维相关任务。"
-  #   tools:
-  #     - run_shell
-  #     - read_file
-  #   route_chat_ids:
-  #     - oc_xxxx
+      - current_time
+      - open_app
+      - index_context
+      - search_context
+      - list_contexts
+      - inspect_context
+      - reindex_context
+      - diff_context
+      - reembed_context
+      - rebind_context
+      - rag_status
+      - memory_remember
+      - memory_search
+      - memory_list
+      - memory_inspect
+      - memory_pin
+      - memory_unpin
+      - memory_compact_to_rag
+      - search_chat

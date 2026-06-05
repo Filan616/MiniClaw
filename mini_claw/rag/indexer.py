@@ -92,13 +92,22 @@ class RagIndexer:
         9. Write rag_chunks
         10. Write rag_chunks_fts (try/except)
         """
+        file_path = Path(path).expanduser()
+        try:
+            path_str = str(file_path.resolve())
+        except OSError:
+            path_str = str(file_path)
+
+        ctx = dict(ctx)
+        if ctx.get("workspace_dir") is not None:
+            ctx["workspace_dir"] = str(ctx["workspace_dir"])
+
         # 1. Permission check
-        allowed, deny_reason = check_index_permission(path, ctx, self.config, self.policy)
+        allowed, deny_reason = check_index_permission(path_str, ctx, self.config, self.policy)
         if not allowed:
             return None, deny_reason
 
         # 2. Read file
-        file_path = Path(path)
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -115,18 +124,18 @@ class RagIndexer:
             limit=1000,
         )
         for item in existing:
-            if item.source_path == path and item.content_hash == content_hash:
+            if item.source_path == path_str and item.content_hash == content_hash:
                 return item.item_id, f"already indexed (item_id={item.item_id})"
 
         # 5. Chunk
-        chunks_data = list(self._chunk_content(content, path))
+        chunks_data = list(self._chunk_content(content, path_str))
         if not chunks_data:
             return None, "no chunks generated (empty file or unsupported format)"
 
-        source_type_value = source_type or self._detect_source_type(path)
+        source_type_value = source_type or self._detect_source_type(path_str)
         extraction = self._anchors.enrich_chunks(
             chunks_data,
-            path=path,
+            path=path_str,
             source_type=source_type_value,
             content=content,
         )
@@ -162,8 +171,8 @@ class RagIndexer:
             chat_id=ctx.get("chat_id"),
             channel_name=ctx.get("channel_name"),
             workspace_dir=ctx.get("workspace_dir"),
-            source_path=path,
-            title=title or Path(path).name,
+            source_path=path_str,
+            title=title or file_path.name,
             content_hash=content_hash,
             status="active",
             created_at=now,

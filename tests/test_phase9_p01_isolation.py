@@ -130,6 +130,28 @@ def test_store_message_writes_channel_name(tmp_path: Path):
     assert row["workspace_dir_inferred"] == 0  # 0 = trustworthy (just written)
 
 
+def test_store_message_accepts_path_workspace_dir(tmp_path: Path):
+    db = Database(tmp_path / "p0.db")
+    sm = SessionManager(db)
+    workspace = tmp_path / "workspace"
+
+    sm.store_message(
+        chat_id="c",
+        agent_id="a",
+        role="assistant",
+        content="prelude",
+        channel_name="feishu",
+        workspace_dir=workspace,
+        message_kind="prelude",
+    )
+
+    row = db.fetchone(
+        "SELECT workspace_dir FROM messages "
+        "WHERE chat_id='c' AND agent_id='a' ORDER BY id DESC LIMIT 1"
+    )
+    assert row["workspace_dir"] == str(workspace)
+
+
 # ===================== get_history channel filter =====================
 
 

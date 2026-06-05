@@ -93,6 +93,21 @@ def test_indexer_creates_item_and_chunks(indexer: RagIndexer, tmp_path: Path):
     assert len(chunks) >= 1
 
 
+def test_indexer_accepts_path_workspace_dir(indexer: RagIndexer, tmp_path: Path):
+    md = tmp_path / "doc.md"
+    md.write_text("# Title\n\nSome content here.\n", encoding="utf-8")
+    ctx = _ctx(tmp_path)
+    ctx["workspace_dir"] = tmp_path
+
+    item_id, error = indexer.index_path(str(md), ctx=ctx)
+
+    assert error == ""
+    assert item_id is not None
+    item = indexer.store.get_item(item_id)
+    assert isinstance(item.workspace_dir, str)
+    assert isinstance(item.source_path, str)
+
+
 def test_indexer_dedup_skips_duplicate(indexer: RagIndexer, tmp_path: Path):
     md = tmp_path / "doc.md"
     md.write_text("# Title\n\nSame content.\n", encoding="utf-8")

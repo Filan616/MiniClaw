@@ -1,10 +1,14 @@
-"""Built-in tools: shell, file I/O, and directory listing."""
+"""Built-in tools: shell, file I/O, directory listing, app opening, and time lookup."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..utils.paths import (
     SensitivePathError,
@@ -13,6 +17,10 @@ from ..utils.paths import (
     ensure_inside,
 )
 from .registry import Tool, ToolContext
+from .open_app import TOOL_OPEN_APP
+
+
+_WEEKDAYS_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +99,134 @@ def _handle_path_error(original_path: str, exc: ValueError, *, ctx: ToolContext)
     return f"[ERROR] {exc}"
 
 
+def _maybe_auto_index_read_file(path: Path, content: str, *, ctx: ToolContext) -> str:
+    """Best-effort auto-index hook for long read_file results."""
+    rag_manager = getattr(ctx, "rag_manager", None)
+    if rag_manager is None:
+        return ""
+
+    config = getattr(rag_manager, "config", None)
+    if config is None or not getattr(config, "enabled", False):
+        return ""
+    if not getattr(getattr(config, "namespaces", None), "context_enabled", False):
+        return ""
+
+    auto_index = getattr(config, "auto_index", None)
+    if auto_index is None or not getattr(auto_index, "enabled", False):
+        return ""
+
+    min_chars = int(getattr(auto_index, "min_chars", 20000) or 0)
+    if len(content) < min_chars:
+        return ""
+
+    if ctx.sandbox_mode == "bypass" and not getattr(
+        getattr(config, "security", None), "allow_index_in_bypass", False
+    ):
+        return "\n\n[RAG auto-index skipped: disabled in bypass mode]"
+
+    try:
+        item_id, error = rag_manager.index_context(
+            str(path),
+            ctx={
+                "agent_id": ctx.agent_id,
+                "workspace_dir": str(ctx.workspace_dir),
+                "sandbox_mode": ctx.sandbox_mode,
+                "chat_id": ctx.chat_id,
+                "session_id": ctx.session_id,
+                "channel_name": ctx.channel_name,
+            },
+        )
+    except Exception as exc:
+        return f"\n\n[RAG auto-index failed: {exc}]"
+
+    if error and not item_id:
+        return f"\n\n[RAG auto-index skipped: {error}]"
+    if error:
+        return f"\n\n[RAG auto-index: {error}]"
+    return f"\n\n[RAG auto-indexed: item_id={item_id}]"
+
+
+def _resolve_timezone(timezone_name: str | None) -> tuple[timezone | ZoneInfo, str] | None:
+    """Resolve a user supplied timezone into a tzinfo object.
+
+    ``ZoneInfo("Asia/Shanghai")`` may be unavailable on Windows machines that
+    do not have the optional tzdata package installed, so common UTC+8 aliases
+    get a small built-in fallback.
+    """
+    if not timezone_name:
+        local_tz = datetime.now().astimezone().tzinfo
+        return (local_tz or timezone.utc, "local")
+
+    name = timezone_name.strip()
+    normalized = name.lower()
+    if normalized in {"utc", "z", "gmt"}:
+        return timezone.utc, "UTC"
+    if normalized in {"asia/shanghai", "china", "cst", "utc+8", "utc+08:00", "+08:00"}:
+        return timezone(timedelta(hours=8)), "Asia/Shanghai"
+
+    offset_match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})?", name)
+    if offset_match:
+        sign, hours_raw, minutes_raw = offset_match.groups()
+        hours = int(hours_raw)
+        minutes = int(minutes_raw or "0")
+        if hours > 23 or minutes > 59:
+            return None
+        delta = timedelta(hours=hours, minutes=minutes)
+        if sign == "-":
+            delta = -delta
+        return timezone(delta), name
+
+    try:
+        return ZoneInfo(name), name
+    except ZoneInfoNotFoundError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# current_time
+# ---------------------------------------------------------------------------
+
+async def _current_time(timezone: str | None = None, *, ctx: ToolContext) -> str:
+    """Return the current date/time in a structured, locale-friendly format."""
+    resolved = _resolve_timezone(timezone)
+    if resolved is None:
+        return f"[ERROR] Unknown timezone: {timezone}"
+
+    tzinfo, resolved_name = resolved
+    now = datetime.now(tzinfo)
+    payload = {
+        "iso": now.isoformat(timespec="seconds"),
+        "date": now.date().isoformat(),
+        "time": now.time().isoformat(timespec="seconds"),
+        "timezone": resolved_name,
+        "utc_offset": now.strftime("%z"),
+        "unix_timestamp": int(now.timestamp()),
+        "weekday": now.strftime("%A"),
+        "weekday_zh": _WEEKDAYS_ZH[now.weekday()],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+TOOL_CURRENT_TIME = Tool(
+    name="current_time",
+    description=(
+        "Get the current date and time. Use this for daily logs, schedules, "
+        "and questions involving today, yesterday, tomorrow, or exact time."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "timezone": {
+                "type": "string",
+                "description": "Optional timezone, e.g. Asia/Shanghai, UTC, or +08:00.",
+            },
+        },
+    },
+    handler=_current_time,
+    permission_level="L0",
+)
+
+
 # ---------------------------------------------------------------------------
 # run_shell
 # ---------------------------------------------------------------------------
@@ -158,10 +294,11 @@ async def _read_file(path: str, *, ctx: ToolContext) -> str:
         return f"[ERROR] File not found: {path}"
 
     try:
-        return file_path.read_text(encoding="utf-8", errors="replace")
+        content = file_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         # Tier 1: Recoverable error - show OS error details
         return f"[ERROR] Cannot read file: {exc}"
+    return content + _maybe_auto_index_read_file(file_path, content, ctx=ctx)
 
 
 TOOL_READ_FILE = Tool(
@@ -269,6 +406,8 @@ TOOL_LIST_DIRECTORY = Tool(
 # ---------------------------------------------------------------------------
 
 BUILTIN_TOOLS: list[Tool] = [
+    TOOL_CURRENT_TIME,
+    TOOL_OPEN_APP,
     TOOL_RUN_SHELL,
     TOOL_READ_FILE,
     TOOL_WRITE_FILE,

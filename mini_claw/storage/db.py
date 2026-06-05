@@ -405,6 +405,16 @@ class Database:
             self._conn.execute(
                 "UPDATE pending_approvals SET channel_name='legacy' WHERE channel_name IS NULL"
             )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Phase 9.7 (Progressive Response): Add message_kind column for prelude/progress messages
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN message_kind TEXT DEFAULT 'normal'")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
         except sqlite3.OperationalError:
             pass
 
@@ -474,6 +484,39 @@ class Database:
                     "FROM session_chain_state_old"
                 )
                 self._conn.execute("DROP TABLE session_chain_state_old")
+        except sqlite3.OperationalError:
+            pass
+
+        # Rebuild pending_confirmations with channel_name in the primary key.
+        # /bypass persistent confirmation must be isolated per channel just like
+        # sessions.sandbox_mode_override.
+        try:
+            cursor = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_confirmations'"
+            )
+            row = cursor.fetchone()
+            if row and "channel_name" not in row["sql"]:
+                self._conn.execute("ALTER TABLE pending_confirmations RENAME TO pending_confirmations_old")
+                self._conn.execute(
+                    """
+                    CREATE TABLE pending_confirmations (
+                        channel_name TEXT NOT NULL DEFAULT 'legacy',
+                        chat_id TEXT NOT NULL,
+                        agent_id TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (channel_name, chat_id, agent_id, type)
+                    )
+                    """
+                )
+                self._conn.execute(
+                    "INSERT INTO pending_confirmations "
+                    "(channel_name, chat_id, agent_id, type, expires_at, created_at) "
+                    "SELECT 'legacy', chat_id, agent_id, type, expires_at, created_at "
+                    "FROM pending_confirmations_old"
+                )
+                self._conn.execute("DROP TABLE pending_confirmations_old")
         except sqlite3.OperationalError:
             pass
 
@@ -902,12 +945,13 @@ CREATE INDEX IF NOT EXISTS idx_security_audit_created_at ON security_audit(creat
 
 -- Pending confirmations (for persistent bypass, etc.)
 CREATE TABLE IF NOT EXISTS pending_confirmations (
+    channel_name TEXT NOT NULL DEFAULT 'feishu',
     chat_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     type TEXT NOT NULL,        -- "bypass_persistent" / future types
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (chat_id, agent_id, type)
+    PRIMARY KEY (channel_name, chat_id, agent_id, type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_confirmations_expires_at ON pending_confirmations(expires_at);

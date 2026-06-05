@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,3 +27,5 @@ class AgentContext:
     session_id: str | None = None  # Phase 9 P0.1: stable session id (sha1 of channel|chat|thread|agent)
     channel_name: str | None = None  # Phase 9 P0.1: channel of this run (feishu / cli / ...)
     chat_search_manager: Any = None  # Phase 9 M9.1: ChatSearchManager instance
+    on_prelude: Callable[[str], Awaitable[None]] | None = None  # Phase 9.7: Progressive response callback
+    prelude_max_length: int = 120  # Phase 9.7: Max prelude length before truncation

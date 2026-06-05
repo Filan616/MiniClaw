@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Callable, Optional
 
 from mini_claw.agent.context import AgentContext
 from mini_claw.providers.base import Provider
@@ -16,6 +19,7 @@ from mini_claw.tools.registry import ToolContext, ToolRegistry
 
 
 MAX_ITERATIONS = 10
+logger = logging.getLogger(__name__)
 
 
 class RunOutcome:
@@ -44,6 +48,7 @@ class AgentRun:
     dangerous_actions: dict[str, Any] = field(default_factory=dict)
     written_scripts: dict[str, str] = field(default_factory=dict)
     rag_injected: bool = False  # Phase 8 M3: prevents double-injection across iterations
+    prelude_sent: bool = False  # Phase 9.7: track if prelude already sent
 
 
 def _call_signature(call_name: str, call_args: dict[str, Any]) -> str:
@@ -84,11 +89,110 @@ def _ctx_to_dict(ctx: AgentContext) -> dict[str, Any]:
     }
 
 
+def _sanitize_prelude(
+    text: str,
+    max_length: int = 120,
+    audit_callback: Callable[[str, dict], None] | None = None,
+) -> str | None:
+    """Sanitize prelude content before sending to user.
+
+    Returns None if content should not be sent as prelude.
+
+    Args:
+        text: Raw prelude text from LLM
+        max_length: Maximum length before truncation
+        audit_callback: Optional callback(event_type, details) for rejected content
+    """
+    original_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+
+    text = text.strip()
+    if not text:
+        return None
+
+    # Max length
+    if len(text) > max_length:
+        text = text[:max_length] + "..."
+
+    # Remove code blocks (```)
+    text = re.sub(r"```[\s\S]*?```", "", text).strip()
+    if not text:
+        if audit_callback:
+            audit_callback(
+                "prelude_sanitized_rejected",
+                {"reason": "code_only", "original_hash": original_hash},
+            )
+        return None
+
+    # Remove inline code (`)
+    text = re.sub(r"`[^`]+`", "", text).strip()
+
+    # Reject completion claims (prelude is BEFORE execution)
+    completion_phrases = [
+        # Chinese
+        "已完成",
+        "已创建",
+        "已修改",
+        "已删除",
+        "已写入",
+        "已读取",
+        "已运行",
+        "已执行",
+        "已索引",
+        "测试通过",
+        "已找到",
+        "结果是",
+        "已生成",
+        "成功创建",
+        "成功修改",
+        "成功删除",
+        # English
+        "completed",
+        "created",
+        "modified",
+        "deleted",
+        "written",
+        "test passed",
+        "tests passed",
+        "found the",
+        "result is",
+        "successfully created",
+        "successfully modified",
+    ]
+    lower = text.lower()
+    if any(phrase in lower for phrase in completion_phrases):
+        if audit_callback:
+            detected = next((p for p in completion_phrases if p in lower), "unknown")
+            audit_callback(
+                "prelude_sanitized_rejected",
+                {
+                    "reason": "completion_claim",
+                    "original_hash": original_hash,
+                    "detected_phrase": detected,
+                },
+            )
+        return None
+
+    # Remove excessive newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    result = text.strip()
+    if len(result) < 2:
+        if audit_callback:
+            audit_callback(
+                "prelude_sanitized_rejected",
+                {"reason": "too_short", "original_hash": original_hash},
+            )
+        return None
+
+    return result
+
+
 def _messages_for_provider(run: AgentRun, ctx: AgentContext) -> list[dict[str, Any]]:
     """Build provider messages with base and skill system prompt context."""
     prompt_parts: list[str] = []
     if ctx.system_prompt:
         prompt_parts.append(ctx.system_prompt.strip())
+    prompt_parts.append(_current_time_prompt())
 
     if ctx.skill_manager is not None:
         fragment = ctx.skill_manager.compose_prompt_fragment(
@@ -244,6 +348,21 @@ def _messages_for_provider(run: AgentRun, ctx: AgentContext) -> list[dict[str, A
     if base_messages and base_messages[0].get("role") == "system":
         return [system_message, *base_messages[1:]]
     return [system_message, *base_messages]
+
+
+def _current_time_prompt() -> str:
+    """Short clock context injected into each provider request."""
+    now = datetime.now().astimezone()
+    tz_name = now.tzname() or "local"
+    offset = now.strftime("%z")
+    if len(offset) == 5:
+        offset = f"{offset[:3]}:{offset[3:]}"
+    return (
+        "[Current Time]\n"
+        f"当前系统时间：{now.strftime('%Y-%m-%d %H:%M:%S')} {tz_name} ({offset})。\n"
+        "当用户询问今天、昨天、明天、日期、时间、日报、周报或日程时，以此为准；"
+        "如需刷新精确时间，可调用 current_time 工具。"
+    )
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -493,16 +612,75 @@ async def run_agent_step(
 
     while run.iterations < MAX_ITERATIONS:
         run.iterations += 1
+        # Tool calls are materially more reliable in non-streaming mode for
+        # OpenAI-compatible providers such as DeepSeek: streamed tool calls can
+        # arrive as partial name/arguments deltas and older parsers may lose or
+        # truncate arguments. Prefer correctness over token-by-token UI updates
+        # whenever tools are available for this turn.
+        use_stream = stream_callback is not None and not tool_schemas
 
         response = await provider.chat(
             messages=_messages_for_provider(run, ctx),
             tools=tool_schemas if tool_schemas else None,
-            stream=True,
-            stream_callback=stream_callback,
+            stream=use_stream,
+            stream_callback=stream_callback if use_stream else None,
         )
 
-        # No tool calls -> conversation complete
+        # No tool calls -> check for hallucination before marking complete
         if not response.tool_calls or response.finish_reason != "tool_calls":
+            # Hallucination detection: model claims action completed without calling tools
+            # Only trigger if the response contains BOTH action verbs AND completion indicators
+            text_lower = (response.text or "").lower()
+
+            # Action verbs that indicate an operation was performed
+            action_verbs = [
+                "创建", "写入", "删除", "执行", "运行", "索引",
+                "create", "write", "delete", "execute", "run", "index"
+            ]
+
+            # Completion indicators that claim the action is done
+            completion_indicators = [
+                "已", "完成", "成功", "好的",  # Chinese
+                "done", "success", "complet", "has been", "have been"  # English
+            ]
+
+            # Check if BOTH patterns exist (reduces false positives)
+            has_action = any(verb in text_lower for verb in action_verbs)
+            has_completion = any(indicator in text_lower for indicator in completion_indicators)
+
+            # Additional check: does the message look like it's claiming to have acted?
+            likely_hallucination = (
+                has_action and has_completion and
+                len(response.text or "") < 200  # Short messages are more likely to be claims vs explanations
+            )
+
+            if likely_hallucination:
+                # Determine which tool should have been called based on action verb
+                suggested_tool = None
+                if any(w in text_lower for w in ["创建", "写入", "create", "write"]):
+                    suggested_tool = "write_file"
+                elif any(w in text_lower for w in ["删除", "delete", "remove"]):
+                    suggested_tool = "delete_file"
+                elif any(w in text_lower for w in ["执行", "运行", "execute", "run"]):
+                    suggested_tool = "run_shell"
+                elif any(w in text_lower for w in ["索引", "index"]):
+                    suggested_tool = "index_context"
+
+                tool_hint = f"例如 {suggested_tool}" if suggested_tool else ""
+
+                # Insert correction message and continue loop to force tool use
+                run.messages.append({"role": "assistant", "content": response.text})
+                run.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM] 你刚才声称完成了操作，但没有实际调用任何工具。\n"
+                        f"请使用相应的工具来完成用户的请求{tool_hint}。\n"
+                        f"工具调用是强制性的，不是可选的。用户需要看到实际的工具执行记录。"
+                    )
+                })
+                continue  # Force another iteration
+
+            # Normal completion: no hallucination detected
             run.status = RunOutcome.DONE
             run.final_answer = response.text
             if response.text:
@@ -526,6 +704,36 @@ async def run_agent_step(
             ],
         }
         run.messages.append(assistant_msg)
+
+        # Phase 9.7: Send prelude if this is the first tool call with content
+        if response.tool_calls and response.text and not run.prelude_sent and ctx.on_prelude:
+            # Create audit callback
+            def audit_rejected(event_type: str, details: dict) -> None:
+                if ctx.audit_logger:
+                    ctx.audit_logger.log_security_event(
+                        event_type=event_type,
+                        details=details,
+                        chat_id=ctx.chat_id,
+                        agent_id=ctx.agent_id,
+                    )
+
+            # Sanitize with audit
+            sanitized = _sanitize_prelude(
+                response.text,
+                max_length=ctx.prelude_max_length,
+                audit_callback=audit_rejected,
+            )
+
+            if sanitized:
+                try:
+                    await ctx.on_prelude(sanitized)
+                    run.prelude_sent = True
+                except Exception:
+                    logger.warning(
+                        "Failed to send prelude, continuing with tool execution",
+                        exc_info=True,
+                        extra={"chat_id": ctx.chat_id, "run_id": run.id},
+                    )
 
         # Group tool calls: parallel-safe (L0 + allow) vs sequential.
         # Phase 0.7: Pre-check permissions for every call BEFORE splitting

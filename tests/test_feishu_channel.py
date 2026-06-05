@@ -100,6 +100,14 @@ async def test_on_message_dispatches_to_main_loop():
     assert msg.text == "hello"
     assert msg.event_id == "evt_001"
 
+    status = channel.health_status()
+    assert status["received_count"] == 1
+    assert status["last_event_id"] == "evt_001"
+    assert status["last_chat_id"] == "oc_123"
+    assert status["last_sender_id"] == "ou_abc"
+    assert status["last_message_type"] == "text"
+    assert status["idle_seconds"] is not None
+
 
 @pytest.mark.asyncio
 async def test_on_card_action_dispatches_to_main_loop():

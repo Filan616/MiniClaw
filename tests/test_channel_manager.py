@@ -48,6 +48,31 @@ class CaptureChannel(Channel):
         self.cards.append((chat_id, approval_id, tool_name, tool_args, level))
 
 
+class CaptureFeishuChannel(CaptureChannel):
+    channel_type = "feishu"
+
+    def health_status(self) -> dict:
+        return {
+            "channel_name": self.name,
+            "channel_type": "feishu",
+            "app_id": "cli_test",
+            "started_at": 1000,
+            "uptime_seconds": 25,
+            "ws_thread_alive": True,
+            "main_loop_alive": True,
+            "received_count": 3,
+            "malformed_count": 0,
+            "last_event_at": 1010,
+            "idle_seconds": 5,
+            "last_event_id": "evt_last",
+            "last_chat_id": "chat_last",
+            "last_sender_id": "sender_last",
+            "last_message_type": "text",
+            "ws_exited_at": None,
+            "ws_exception": "",
+        }
+
+
 def test_load_config_expands_legacy_feishu_channels(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -162,3 +187,62 @@ async def test_gateway_replies_on_inbound_channel(tmp_path: Path):
         ("evt_cli_1",),
     )
     assert event["channel_name"] == "cli"
+
+
+@pytest.mark.asyncio
+async def test_gateway_handles_feishu_status_command(tmp_path: Path):
+    cfg = AppConfig(
+        agents=[AgentConfig(id="default", tools=[])],
+        channels=[ChannelConfig(name="feishu", type="feishu", enabled=False)],
+    )
+    db = Database(tmp_path / "gateway.db")
+    workspace_manager = WorkspaceManager(tmp_path / "workspaces")
+    workspace_manager.load_workspaces(cfg.agents)
+    agent_manager = AgentManager(db, cfg, workspace_manager)
+    provider = DummyProvider()
+    provider_manager = ProviderManager(cfg, default_provider=provider)
+    channel_manager = ChannelManager(cfg)
+    registry = ToolRegistry()
+    permission_gate = PermissionGate(
+        PermissionPolicy(cfg.permissions),
+        ApprovalStore(db),
+    )
+
+    gateway = Gateway(
+        config=cfg,
+        storage=db,
+        provider=provider,
+        provider_manager=provider_manager,
+        registry=registry,
+        permission_gate=permission_gate,
+        result_processor=ToolResultProcessor(),
+        workspace_manager=workspace_manager,
+        agent_manager=agent_manager,
+        channel_manager=channel_manager,
+    )
+    channel_manager.set_gateway(gateway)
+    feishu_channel = CaptureFeishuChannel(name="feishu")
+    channel_manager.register_instance(feishu_channel)
+
+    await gateway.handle_message(
+        InboundMessage(
+            channel_name="feishu",
+            chat_id="oc_status",
+            sender_id="tester",
+            text="/feishu status",
+            event_id="evt_feishu_status",
+            timestamp=1,
+        )
+    )
+
+    assert len(feishu_channel.sent) == 1
+    response = feishu_channel.sent[0][1]
+    assert "Feishu status:" in response
+    assert "ws_thread_alive: True" in response
+    assert "received_count: 3" in response
+    assert "last_event_id: evt_last" in response
+    event = db.fetchone(
+        "SELECT status FROM processed_events WHERE event_id=?",
+        ("evt_feishu_status",),
+    )
+    assert event["status"] == "handled"

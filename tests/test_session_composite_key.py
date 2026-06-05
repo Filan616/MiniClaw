@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mini_claw.gateway.session import SessionManager
+from mini_claw.commands.bypass import handle_bypass_command
 from mini_claw.storage.db import Database
 
 
@@ -107,3 +108,66 @@ def test_effective_sandbox_mode_per_channel(session_mgr: SessionManager):
 
     assert feishu == "bypass"
     assert cli == "safe"  # No override, defaults to safe
+
+
+def test_bypass_command_writes_current_channel(session_mgr: SessionManager, storage: Database):
+    """Phase C6: /bypass must update the current channel session, not default feishu."""
+    session_mgr.get_or_create("chat_005", "agent_e", channel_name="feishu")
+    session_mgr.get_or_create("chat_005", "agent_e", channel_name="cli")
+
+    result = handle_bypass_command(
+        storage,
+        "chat_005",
+        "agent_e",
+        "/bypass",
+        channel_name="cli",
+    )
+
+    assert result is not None
+    assert session_mgr.get_effective_sandbox_mode(
+        "chat_005", "agent_e", channel_name="cli"
+    ) == "bypass"
+    assert session_mgr.get_effective_sandbox_mode(
+        "chat_005", "agent_e", channel_name="feishu"
+    ) == "safe"
+
+
+def test_bypass_persistent_confirmation_is_channel_scoped(
+    session_mgr: SessionManager, storage: Database
+):
+    """A persistent bypass confirmation created on cli must not confirm feishu."""
+    session_mgr.get_or_create("chat_006", "agent_f", channel_name="feishu")
+    session_mgr.get_or_create("chat_006", "agent_f", channel_name="cli")
+
+    handle_bypass_command(
+        storage,
+        "chat_006",
+        "agent_f",
+        "/bypass persistent",
+        channel_name="cli",
+    )
+    wrong_channel = handle_bypass_command(
+        storage,
+        "chat_006",
+        "agent_f",
+        "/bypass confirm",
+        channel_name="feishu",
+    )
+    assert wrong_channel is not None
+    assert "No pending bypass confirmation" in wrong_channel.message
+    assert session_mgr.get_effective_sandbox_mode(
+        "chat_006", "agent_f", channel_name="feishu"
+    ) == "safe"
+
+    right_channel = handle_bypass_command(
+        storage,
+        "chat_006",
+        "agent_f",
+        "/bypass confirm",
+        channel_name="cli",
+    )
+    assert right_channel is not None
+    assert "Persistent bypass enabled" in right_channel.message
+    assert session_mgr.get_effective_sandbox_mode(
+        "chat_006", "agent_f", channel_name="cli"
+    ) == "bypass"

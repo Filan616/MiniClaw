@@ -256,7 +256,24 @@ class WorkflowConfig(BaseModel):
 class AgentConfig(BaseModel):
     id: str = "default"
     name: str | None = None
-    system_prompt: str = "你是一个高效的个人助手，能调用工具帮用户完成各种任务。"
+    system_prompt: str = (
+        "你是一个高效的个人助手，自称噜噜，能调用工具帮用户完成各种任务。\n\n"
+        "## Tool Usage Policy\n"
+        "- When the user requests an ACTION (create, write, delete, run, execute, index, remember), "
+        "you MUST call the corresponding tool.\n"
+        "- NEVER claim you have completed an action without actually calling the tool.\n"
+        "- If you're unsure which tool to use, ask the user for clarification.\n\n"
+        "当用户要求执行操作（创建、写入、删除、运行、索引、记住等）时，你必须调用相应的工具。"
+        "绝不要在没有实际调用工具的情况下声称已完成操作。\n\n"
+        "## 操作前回应（Prelude）\n"
+        "如果用户请求需要调用工具或较长处理，在第一次工具调用的 assistant message 中，"
+        "生成一句简短自然的操作前回应，告诉用户你**将要**做什么（不要说**已经**完成）。\n"
+        "示例：\n"
+        "- 用户\"帮我创建文件\" → 你\"好的，让我为你创建这个文件。\" + [调用 write_file]\n"
+        "- 用户\"分析日志\" → 你\"收到，我先读取并整理日志主要错误。\" + [调用 read_file]\n"
+        "如果是普通闲聊或无需工具的简单回答，不要生成额外的操作前回应。\n"
+        "禁止说\"已完成\"、\"已创建\"、\"测试通过\"等完成声明，只说\"我将\"、\"我会\"、\"让我\"、\"我先\"等将来时态。"
+    )
     workspace: str | None = None
     provider: ProviderConfig | None = None
     provider_fallback: list[ProviderConfig] = Field(default_factory=list)
@@ -264,7 +281,13 @@ class AgentConfig(BaseModel):
     model: str | None = None
     enabled: bool = True
     tools: list[str] = Field(
-        default_factory=lambda: ["run_shell", "read_file", "write_file"]
+        default_factory=lambda: [
+            "current_time",
+            "open_app",
+            "run_shell",
+            "read_file",
+            "write_file",
+        ]
     )
     skills: list[str] = Field(default_factory=list)
     route_chat_ids: list[str] = Field(default_factory=list)
@@ -357,6 +380,7 @@ class RagLifecycleConfig(BaseModel):
 
 class RagAutoIndexConfig(BaseModel):
     enabled: bool = False
+    min_chars: int = 20000
     max_file_size_mb: int = 5
     require_non_sensitive: bool = True
 

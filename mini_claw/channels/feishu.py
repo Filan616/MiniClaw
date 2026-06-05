@@ -71,6 +71,18 @@ class FeishuChannel(Channel):
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
         self._ws_client: lark.ws.Client | None = None
+        self._started_at: float | None = None
+        self._last_event_at: float | None = None
+        self._last_event_id: str = ""
+        self._last_chat_id: str = ""
+        self._last_sender_id: str = ""
+        self._last_message_type: str = ""
+        self._received_count: int = 0
+        self._malformed_count: int = 0
+        self._ws_exited_at: float | None = None
+        self._ws_exception: str = ""
+        self._health_lock = threading.Lock()
+        self._health_task: asyncio.Task | None = None
 
         # Streaming state: track active stream per chat
         self._active_stream: dict[str, dict[str, Any]] = {}
@@ -266,6 +278,10 @@ class FeishuChannel(Channel):
             return
 
         self._main_loop = asyncio.get_running_loop()
+        with self._health_lock:
+            self._started_at = time.time()
+            self._ws_exited_at = None
+            self._ws_exception = ""
 
         handler = (
             lark.EventDispatcherHandler.builder("", "", self._log_level)
@@ -286,11 +302,15 @@ class FeishuChannel(Channel):
             daemon=True,
         )
         self._ws_thread.start()
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(self._health_monitor_loop())
         logger.info("Feishu 长连接已启动 (app_id=%s)", self.app_id)
 
     async def stop(self) -> None:
         """Best-effort shutdown. The SDK does not expose a clean stop, so the
         daemon thread is left to die with the process."""
+        if self._health_task is not None and not self._health_task.done():
+            self._health_task.cancel()
         try:
             await self._http.aclose()
         except Exception:  # pragma: no cover
@@ -311,8 +331,79 @@ class FeishuChannel(Channel):
         try:
             assert self._ws_client is not None
             self._ws_client.start()
-        except Exception:
+            with self._health_lock:
+                self._ws_exited_at = time.time()
+                self._ws_exception = ""
+            logger.warning("Feishu 长连接 start() 已返回")
+        except Exception as exc:
+            with self._health_lock:
+                self._ws_exited_at = time.time()
+                self._ws_exception = repr(exc)
             logger.exception("Feishu 长连接异常退出")
+
+    async def _health_monitor_loop(self) -> None:
+        """Periodically log inbound health so silent drops are visible."""
+        try:
+            while True:
+                await asyncio.sleep(60)
+                status = self.health_status()
+                idle = status.get("idle_seconds")
+                idle_text = "never" if idle is None else f"{idle:.0f}s"
+                log = logger.warning if idle is not None and idle >= 300 else logger.info
+                log(
+                    "Feishu 长连接健康: thread_alive=%s received=%s idle=%s "
+                    "last_event=%s last_chat=%s exited_at=%s exception=%s",
+                    status["ws_thread_alive"],
+                    status["received_count"],
+                    idle_text,
+                    status["last_event_id"] or "-",
+                    status["last_chat_id"] or "-",
+                    status["ws_exited_at"] or "-",
+                    status["ws_exception"] or "-",
+                )
+        except asyncio.CancelledError:
+            return
+
+    def health_status(self) -> dict[str, Any]:
+        """Return a snapshot of long-connection inbound health."""
+        now = time.time()
+        thread_alive = self._ws_thread is not None and self._ws_thread.is_alive()
+        main_loop_alive = self._main_loop is not None and not self._main_loop.is_closed()
+        with self._health_lock:
+            started_at = self._started_at
+            last_event_at = self._last_event_at
+            return {
+                "channel_name": self.name,
+                "channel_type": self.channel_type,
+                "app_id": self.app_id,
+                "started_at": int(started_at) if started_at is not None else None,
+                "uptime_seconds": int(now - started_at) if started_at is not None else None,
+                "ws_thread_alive": thread_alive,
+                "main_loop_alive": main_loop_alive,
+                "received_count": self._received_count,
+                "malformed_count": self._malformed_count,
+                "last_event_at": int(last_event_at) if last_event_at is not None else None,
+                "idle_seconds": int(now - last_event_at) if last_event_at is not None else None,
+                "last_event_id": self._last_event_id,
+                "last_chat_id": self._last_chat_id,
+                "last_sender_id": self._last_sender_id,
+                "last_message_type": self._last_message_type,
+                "ws_exited_at": int(self._ws_exited_at) if self._ws_exited_at is not None else None,
+                "ws_exception": self._ws_exception,
+            }
+
+    def _record_message_event(self, msg: InboundMessage, message_type: str) -> None:
+        with self._health_lock:
+            self._received_count += 1
+            self._last_event_at = time.time()
+            self._last_event_id = msg.event_id
+            self._last_chat_id = msg.chat_id
+            self._last_sender_id = msg.sender_id or ""
+            self._last_message_type = message_type
+
+    def _record_malformed_event(self) -> None:
+        with self._health_lock:
+            self._malformed_count += 1
 
     # ------------------------------------------------------------------
     # Event handlers (called by lark on the WS thread)
@@ -322,6 +413,7 @@ class FeishuChannel(Channel):
         try:
             data = event.event
             if data is None or data.message is None:
+                self._record_malformed_event()
                 logger.warning("飞书消息事件缺少 data/message，已忽略")
                 return
             msg_obj = data.message
@@ -350,6 +442,7 @@ class FeishuChannel(Channel):
                 event_id=event_id,
                 timestamp=int(msg_obj.create_time or 0),
             )
+            self._record_message_event(msg, msg_obj.message_type or "")
 
             logger.info(
                 "飞书消息收到 chat=%s sender=%s text=%r event_id=%s msg_type=%s",

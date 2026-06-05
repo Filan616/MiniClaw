@@ -213,6 +213,8 @@ agents:
       - read_file
       - write_file
       - list_directory
+      - current_time
+      - open_app
 
 # Phase 9 — chat search (messages_fts)
 chat_search:

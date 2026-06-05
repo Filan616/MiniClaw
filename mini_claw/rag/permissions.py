@@ -92,6 +92,10 @@ def check_search_scope(
     1. scope_filter must match current agent_id / workspace_dir / session_id (default scope)
     2. cross-agent context sharing requires config.sharing.allow_cross_agent_context=True
     3. (M2.5) query not in EXFIL_QUERY_KEYWORDS
+
+    Phase 9 fix: workspace_dir comparison normalizes both sides via Path.resolve()
+    to handle cases where stored paths contain unresolved relative segments
+    (e.g. "workspaces/../..") vs. resolved canonical forms.
     """
     current_agent_id = ctx.get("agent_id", "")
     current_workspace_dir = ctx.get("workspace_dir")
@@ -106,10 +110,24 @@ def check_search_scope(
         if not config.sharing.allow_cross_agent_context:
             return False, "cross-agent context access denied by policy"
 
-    # Workspace scope check
-    if requested_workspace_dir and requested_workspace_dir != str(current_workspace_dir):
-        if not config.sharing.allow_workspace_context_sharing:
-            return False, "cross-workspace context access denied by policy"
+    # Workspace scope check (normalize both sides to handle unresolved paths)
+    if requested_workspace_dir:
+        try:
+            req_norm = str(Path(str(requested_workspace_dir)).resolve())
+        except (OSError, ValueError):
+            req_norm = str(requested_workspace_dir)
+        try:
+            cur_norm = (
+                str(Path(str(current_workspace_dir)).resolve())
+                if current_workspace_dir is not None
+                else None
+            )
+        except (OSError, ValueError):
+            cur_norm = str(current_workspace_dir) if current_workspace_dir else None
+
+        if req_norm != cur_norm:
+            if not config.sharing.allow_workspace_context_sharing:
+                return False, "cross-workspace context access denied by policy"
 
     # Session scope check (always enforced unless explicitly overridden)
     if requested_session_id and requested_session_id != current_session_id:

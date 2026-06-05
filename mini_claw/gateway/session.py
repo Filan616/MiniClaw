@@ -201,7 +201,11 @@ class SessionManager:
         return "safe"
 
     def get_history(
-        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+        self,
+        chat_id: str,
+        agent_id: str,
+        channel_name: str = "feishu",
+        include_preludes: bool = False,
     ) -> list[dict[str, Any]]:
         """Get recent messages for context window construction.
 
@@ -214,14 +218,20 @@ class SessionManager:
         3. Assemble: [All summaries oldest first] + [All normal messages chronological]
 
         This ensures the LLM sees: [Summary] -> [Recent messages]
+
+        Phase 9.7: By default, filters out preludes (message_kind='prelude').
+        Set include_preludes=True to include them.
         """
         # Get all uncompacted messages ordered by id
         # Phase 9 P0.6: Strict channel_name matching enforced (legacy compatibility removed)
+        # Phase 9.7: Filter out preludes by default
+        kind_filter = "" if include_preludes else "AND COALESCE(message_kind, 'normal') != 'prelude' "
         rows = self._storage.fetchall(
             "SELECT role, content, tool_calls, tool_call_id, is_compaction_summary "
             "FROM messages "
             "WHERE chat_id = ? AND agent_id = ? "
             "AND channel_name = ? "
+            f"{kind_filter}"
             "AND COALESCE(compacted, 0) = 0 "
             "ORDER BY id ASC",
             (chat_id, agent_id, channel_name),
@@ -265,6 +275,7 @@ class SessionManager:
         run_id: str | None = None,
         channel_name: str = "feishu",
         workspace_dir: str | None = None,
+        message_kind: str = "normal",
     ) -> None:
         """Persist a message to the history store.
 
@@ -273,13 +284,16 @@ class SessionManager:
         get_history / count_messages (legacy compatibility removed).
 
         Phase 9 M9.1: Also mirrors to messages_fts for chat_search.
+        Phase 9.7: ``message_kind`` in ('normal', 'prelude') marks preludes for UI filtering.
         """
+        workspace_dir_str = str(workspace_dir) if workspace_dir is not None else None
+
         now = int(time.time())
         cursor = self._storage.execute(
             "INSERT INTO messages (chat_id, agent_id, run_id, role, content, created_at, "
-            "channel_name, workspace_dir, workspace_dir_inferred) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, agent_id, run_id, role, content, now, channel_name, workspace_dir, 0),
+            "channel_name, workspace_dir, workspace_dir_inferred, message_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, agent_id, run_id, role, content, now, channel_name, workspace_dir_str, 0, message_kind),
         )
         message_id = cursor.lastrowid
 
@@ -295,7 +309,7 @@ class SessionManager:
                     agent_id=agent_id,
                     chat_id=chat_id,
                     channel_name=channel_name,
-                    workspace_dir=workspace_dir,
+                    workspace_dir=workspace_dir_str,
                     role=role,
                     content=content,
                     created_at=now,

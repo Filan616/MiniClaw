@@ -145,6 +145,145 @@ class Gateway:
             return self._channel_manager.get_channel(channel_name)
         return self._channel
 
+    async def _handle_feishu_command(self, msg: InboundMessage, channel: Channel) -> bool:
+        """Handle Feishu channel diagnostics commands."""
+        text = msg.text.strip()
+        if text not in {"/feishu", "/feishu status", "/feishu help"}:
+            return False
+
+        if text in {"/feishu", "/feishu help"}:
+            await channel.send(
+                msg.chat_id,
+                "Usage: /feishu status\n\n"
+                "Shows Feishu long-connection health: thread state, received event "
+                "count, last event time, and idle seconds.",
+            )
+            return True
+
+        candidates: list[Channel] = []
+        if self._channel_manager is not None:
+            candidates.extend(self._channel_manager.list_channels())
+        elif self._channel is not None:
+            candidates.append(self._channel)
+
+        feishu_channels = [
+            ch for ch in candidates
+            if getattr(ch, "channel_type", "") == "feishu" or hasattr(ch, "health_status")
+        ]
+        if not feishu_channels:
+            await channel.send(msg.chat_id, "No Feishu channel is loaded.")
+            return True
+
+        lines = ["Feishu status:"]
+        for ch in feishu_channels:
+            health_fn = getattr(ch, "health_status", None)
+            if not callable(health_fn):
+                lines.append(f"\n- {ch.name}: health_status unavailable")
+                continue
+            lines.extend(self._format_feishu_status(health_fn()))
+
+        await channel.send(msg.chat_id, "\n".join(lines))
+        return True
+
+    def _format_feishu_status(self, status: dict[str, Any]) -> list[str]:
+        def fmt_ts(value: Any) -> str:
+            if value in (None, ""):
+                return "-"
+            try:
+                return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
+            except (TypeError, ValueError, OSError):
+                return str(value)
+
+        idle = status.get("idle_seconds")
+        idle_text = "never" if idle is None else f"{idle}s"
+        uptime = status.get("uptime_seconds")
+        uptime_text = "-" if uptime is None else f"{uptime}s"
+        return [
+            f"\n- Channel: {status.get('channel_name', '-')}",
+            f"  app_id: {status.get('app_id', '-')}",
+            f"  ws_thread_alive: {status.get('ws_thread_alive')}",
+            f"  main_loop_alive: {status.get('main_loop_alive')}",
+            f"  started_at: {fmt_ts(status.get('started_at'))}",
+            f"  uptime: {uptime_text}",
+            f"  received_count: {status.get('received_count', 0)}",
+            f"  malformed_count: {status.get('malformed_count', 0)}",
+            f"  last_event_at: {fmt_ts(status.get('last_event_at'))}",
+            f"  idle: {idle_text}",
+            f"  last_event_id: {status.get('last_event_id') or '-'}",
+            f"  last_chat_id: {status.get('last_chat_id') or '-'}",
+            f"  last_sender_id: {status.get('last_sender_id') or '-'}",
+            f"  last_message_type: {status.get('last_message_type') or '-'}",
+            f"  ws_exited_at: {fmt_ts(status.get('ws_exited_at'))}",
+            f"  ws_exception: {status.get('ws_exception') or '-'}",
+        ]
+
+    async def _send_prelude(
+        self,
+        chat_id: str,
+        agent_id: str,
+        channel: Channel,
+        channel_name: str,
+        workspace_dir: str,
+        run_id: str,
+        text: str,
+    ) -> None:
+        """Phase 9.7: Send prelude to user and store with message_kind='prelude'.
+
+        Called by AgentLoop when the first tool call has accompanying text.
+        Fire-and-forget: failures are logged but do not interrupt tool execution.
+        """
+        try:
+            await channel.send(chat_id, text)
+            self._session_mgr.store_message(
+                chat_id=chat_id,
+                agent_id=agent_id,
+                role="assistant",
+                content=text,
+                run_id=run_id,
+                channel_name=channel_name,
+                workspace_dir=workspace_dir,
+                message_kind="prelude",
+            )
+        except Exception:
+            logger.warning(
+                "Prelude send or storage failed",
+                exc_info=True,
+                extra={"chat_id": chat_id, "run_id": run_id},
+            )
+
+    async def _send_command_prelude(
+        self,
+        msg: InboundMessage,
+        channel: Channel,
+        channel_name: str,
+        agent_id: str,
+        text: str,
+    ) -> None:
+        """Phase 9.7 M4: Send prelude for command-initiated long tasks.
+
+        Used by /context index, /context reindex, /memory export, /maintenance, etc.
+        Fire-and-forget: failures are logged but do not interrupt command execution.
+        """
+        workspace_dir = self._workspace_manager.get_workspace(msg.chat_id, agent_id)
+        try:
+            await channel.send(msg.chat_id, text)
+            self._session_mgr.store_message(
+                chat_id=msg.chat_id,
+                agent_id=agent_id,
+                role="assistant",
+                content=text,
+                run_id=None,  # Commands don't have a run_id
+                channel_name=channel_name,
+                workspace_dir=workspace_dir,
+                message_kind="prelude",
+            )
+        except Exception:
+            logger.warning(
+                "Command prelude send or storage failed",
+                exc_info=True,
+                extra={"chat_id": msg.chat_id, "command": msg.text[:50]},
+            )
+
     async def _with_workspace_lock(self, agent_id: str, workspace_dir: str, coro):
         """Unified workspace lock wrapper for all entry points that execute tools."""
         lock_key = f"{agent_id}:{workspace_dir}"
@@ -393,11 +532,18 @@ class Gateway:
             # Covers /bypass, /bypass next, /bypass <duration>, /bypass persistent,
             # and /bypass confirm. Returns None if the message is not a /bypass command.
             bypass_result = handle_bypass_command(
-                self._storage, msg.chat_id, agent_id, msg.text
+                self._storage, msg.chat_id, agent_id, msg.text, channel_name=channel_name
             )
             if bypass_result is not None:
                 await channel.send(msg.chat_id, bypass_result.message)
                 # Mark event as handled
+                self._storage.execute(
+                    "UPDATE processed_events SET status='handled', finished_at=? WHERE event_id=?",
+                    (int(time.time()), msg.event_id),
+                )
+                return
+
+            if await self._handle_feishu_command(msg, channel):
                 self._storage.execute(
                     "UPDATE processed_events SET status='handled', finished_at=? WHERE event_id=?",
                     (int(time.time()), msg.event_id),
@@ -519,6 +665,11 @@ class Gateway:
                         msg.chat_id, agent_id, channel_name, str(workspace_dir) if workspace_dir else None
                     )
 
+            # Phase 9.7: Replaced delayed acknowledgment with intelligent prelude.
+            # The prelude is generated by the LLM as part of the first tool call,
+            # and sent before tool execution. See AgentContext.on_prelude.
+            # Casual chats (no tool calls) naturally skip prelude.
+
             # Create agent_run record
             run_id = str(uuid.uuid4())
             now = int(time.time())
@@ -558,6 +709,16 @@ class Gateway:
                 session_id=session_id,
                 channel_name=channel_name,
                 chat_search_manager=self._chat_search_manager,
+                on_prelude=lambda text: self._send_prelude(
+                    chat_id=msg.chat_id,
+                    agent_id=agent_id,
+                    channel=channel,
+                    channel_name=channel_name,
+                    workspace_dir=workspace_dir,
+                    run_id=run_id,
+                    text=text,
+                ),
+                prelude_max_length=500,
             )
 
             # Load conversation history for context
@@ -703,6 +864,16 @@ class Gateway:
             ),
             channel_name=channel_name,
             chat_search_manager=self._chat_search_manager,
+            on_prelude=lambda text: self._send_prelude(
+                chat_id=run_row["chat_id"],
+                agent_id=run_row["agent_id"],
+                channel=channel,
+                channel_name=channel_name,
+                workspace_dir=workspace_dir,
+                run_id=run_row["id"],
+                text=text,
+            ),
+            prelude_max_length=500,
         )
 
         history = self._session_mgr.get_history(
@@ -1068,7 +1239,7 @@ class Gateway:
             "workspace_dir": workspace_dir,
             "sandbox_mode": sandbox_mode,
             "chat_id": msg.chat_id,
-            "session_id": getattr(msg, "session_id", None),
+            "session_id": derive_session_id(channel_name, msg.chat_id, agent_id),
             "channel_name": channel_name,
         }
 
@@ -1076,6 +1247,11 @@ class Gateway:
             if not argument:
                 await channel.send(msg.chat_id, "Usage: /context index <path>")
                 return True
+            # Phase 9.7 M4: Command Prelude
+            await self._send_command_prelude(
+                msg, channel, channel_name, agent_id,
+                f"好的，我先为 `{argument}` 建立上下文索引。",
+            )
             item_id, error = self._rag_manager.index_context(argument, ctx=ctx_dict)
             if error and not item_id:
                 await channel.send(msg.chat_id, f"[ERROR] {error}")
@@ -1184,6 +1360,108 @@ class Gateway:
                 f"Sensitivity: {item.sensitivity_level}\n"
                 f"Hash: {item.content_hash}\n"
                 f"Active version: {item.active_version}",
+            )
+            return True
+
+        # /context use <id> — set active context for current session
+        if command == "use":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /context use <id>")
+                return True
+            # argument may include trailing extra text; take only the first token as id
+            context_id = argument.split(maxsplit=1)[0]
+            ok, error = self._rag_manager.use_context(context_id, ctx=ctx_dict)
+            if not ok:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            await channel.send(
+                msg.chat_id,
+                f"Active context set: {context_id}\n"
+                "Subsequent /context search will boost results from this context.\n"
+                "Tip: to ask a question about it, use /context search <query>.",
+            )
+            return True
+
+        # /context archive <id> — mark item status='archived'
+        if command == "archive":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /context archive <id>")
+                return True
+            context_id = argument.split(maxsplit=1)[0]
+            ok, error = self._rag_manager.archive_context(context_id, ctx=ctx_dict)
+            if not ok:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            await channel.send(msg.chat_id, f"Archived: {context_id}")
+            return True
+
+        # /context delete <id> — 7-step atomic delete
+        if command == "delete":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /context delete <id>")
+                return True
+            context_id = argument.split(maxsplit=1)[0]
+            ok, error = self._rag_manager.delete_context(context_id, ctx=ctx_dict)
+            if not ok:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            await channel.send(msg.chat_id, f"Deleted: {context_id}")
+            return True
+
+        # /context reindex <id> — atomic version-bump reindex
+        if command == "reindex":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /context reindex <id>")
+                return True
+            context_id = argument.split(maxsplit=1)[0]
+            # Phase 9.7 M4: Command Prelude
+            await self._send_command_prelude(
+                msg, channel, channel_name, agent_id,
+                f"收到，我先重新索引 `{context_id}` 的内容。",
+            )
+            ok, error = self._rag_manager.reindex_context(context_id, ctx=ctx_dict)
+            if not ok:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            await channel.send(msg.chat_id, f"Reindexed: {context_id}")
+            return True
+
+        # /context rebind <id> <new_path> — update source_path (hash-checked)
+        if command == "rebind":
+            tokens = argument.split(maxsplit=1) if argument else []
+            if len(tokens) < 2:
+                await channel.send(
+                    msg.chat_id, "Usage: /context rebind <id> <new_path>"
+                )
+                return True
+            context_id, new_path = tokens[0], tokens[1].strip()
+            ok, error = self._rag_manager.rebind_context(
+                context_id, new_path, ctx=ctx_dict
+            )
+            if not ok:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            await channel.send(msg.chat_id, f"Rebound {context_id} -> {new_path}")
+            return True
+
+        # /context cleanup — run one lifecycle pass
+        if command == "cleanup":
+            counts = self._rag_manager.cleanup_lifecycle()
+            summary = ", ".join(f"{k}={v}" for k, v in counts.items()) or "no changes"
+            await channel.send(msg.chat_id, f"Lifecycle cleanup: {summary}")
+            return True
+
+        # Unknown /context subcommand — fall through to fallback at end of function
+        # (the /memory subcommands below also use the same `command` variable; we
+        #  rely on the dispatcher in `_handle_memory_command` to route /memory
+        #  commands separately. This branch only executes when text starts with
+        #  /context, so any unmatched command is a /context subcommand.)
+        if text.startswith("/context"):
+            await channel.send(
+                msg.chat_id,
+                f"Unknown /context subcommand: {command}. "
+                "Try: /context index|search|list|inspect|use|archive|delete|"
+                "reindex|rebind|cleanup",
             )
             return True
 
@@ -1599,6 +1877,12 @@ class Gateway:
                         + f" --approve {approval_id}",
                     )
                     return True
+
+            # Phase 9.7 M4: Command Prelude before export execution
+            await self._send_command_prelude(
+                msg, channel, channel_name, agent_id,
+                f"收到，我先导出 `{scope_type}` 范围的记忆数据。",
+            )
 
             export_data, error = self._rag_manager.export_memories(
                 scope_type, scope_id=None, ctx=ctx_dict, full_content=full_content
@@ -2191,6 +2475,11 @@ class Gateway:
                 return True
 
             # default / explicit "run"
+            # Phase 9.7 M4: Command Prelude before maintenance run
+            await self._send_command_prelude(
+                msg, channel, channel_name, agent_id,
+                f"收到，我先扫描 `{scope}` 范围的记忆维护建议。",
+            )
             result = self._rag_manager.run_memory_maintenance(ctx=ctx_dict, scope=scope)
 
             if result.get("error"):
@@ -2566,6 +2855,201 @@ class Gateway:
 
         await channel.send(
             msg.chat_id, f"Unknown /memory subcommand: {command}"
+        )
+        return True
+
+    async def _handle_memory_command(
+        self,
+        msg: InboundMessage,
+        agent_id: str,
+        channel: Channel,
+        channel_name: str,
+    ) -> bool:
+        """Handle low-risk /memory commands.
+
+        The larger memory approval/export/clear flows still need a cleanup pass,
+        but this method keeps normal memory commands from falling through to an
+        AttributeError and breaking channel callbacks.
+        """
+        text = msg.text.strip()
+        parts = text.split(maxsplit=2)
+        command = parts[1].lower() if len(parts) > 1 else ""
+        argument = parts[2].strip() if len(parts) > 2 else ""
+
+        if not self._config.rag.enabled or not self._config.rag.namespaces.memory_enabled:
+            await channel.send(
+                msg.chat_id,
+                "Memory RAG is disabled. To enable, set rag.enabled=true and "
+                "rag.namespaces.memory_enabled=true in config.yaml.",
+            )
+            return True
+        if self._rag_manager is None:
+            await channel.send(msg.chat_id, "RAG manager not initialized.")
+            return True
+
+        workspace_dir = (
+            self._workspace_manager.get_workspace(msg.chat_id, agent_id)
+            if self._workspace_manager
+            else None
+        )
+        session_id = derive_session_id(channel_name, msg.chat_id, agent_id)
+        ctx_dict = {
+            "agent_id": agent_id,
+            "chat_id": msg.chat_id,
+            "channel_name": channel_name,
+            "workspace_dir": str(workspace_dir) if workspace_dir else None,
+            "session_id": session_id,
+        }
+
+        if command in {"", "help"}:
+            await channel.send(
+                msg.chat_id,
+                "Usage: /memory remember <text> | /memory list | "
+                "/memory search <query> | /memory inspect <id> | "
+                "/memory candidates | /memory approve <cand_id> | "
+                "/memory reject <cand_id>",
+            )
+            return True
+
+        if command == "remember":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /memory remember <text>")
+                return True
+            cand_id, approval_id, status = self._rag_manager.remember(
+                argument,
+                ctx=ctx_dict,
+            )
+            if status.startswith("rejected:"):
+                await channel.send(msg.chat_id, f"[ERROR] {status}")
+                return True
+            await channel.send(
+                msg.chat_id,
+                f"Memory candidate created.\n"
+                f"  candidate_id: {cand_id}\n"
+                f"  approval_id : {approval_id}\n"
+                f"  status      : {status}",
+            )
+            return True
+
+        if command == "list":
+            limit = 20
+            tokens = text.split()
+            if "--limit" in tokens:
+                try:
+                    limit = max(1, min(100, int(tokens[tokens.index("--limit") + 1])))
+                except (ValueError, IndexError):
+                    await channel.send(msg.chat_id, "Usage: /memory list [--limit N]")
+                    return True
+            memories = self._rag_manager.list_memories(ctx=ctx_dict, limit=limit)
+            if not memories:
+                await channel.send(msg.chat_id, "No active memories.")
+                return True
+            lines = [f"Active memories ({len(memories)}):"]
+            for item in memories:
+                title = item.title or item.source_type or "memory"
+                lines.append(
+                    f"- {item.item_id}: {title} "
+                    f"[{item.source_type}, pinned={item.pinned}, confidence={item.confidence}]"
+                )
+            await channel.send(msg.chat_id, "\n".join(lines))
+            return True
+
+        if command == "search":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /memory search <query> [--scope agent|workspace|user|all]")
+                return True
+            tokens = text.split()
+            scope = "agent"
+            if "--scope" in tokens:
+                try:
+                    scope = tokens[tokens.index("--scope") + 1]
+                except IndexError:
+                    await channel.send(msg.chat_id, "Usage: /memory search <query> [--scope agent|workspace|user|all]")
+                    return True
+                argument = " ".join(
+                    t for i, t in enumerate(tokens[2:])
+                    if t != "--scope" and (i == 0 or tokens[i + 1] != "--scope")
+                ).strip()
+            results, error = self._rag_manager.search_memory(
+                argument,
+                ctx=ctx_dict,
+                scope=scope,
+            )
+            if error:
+                await channel.send(msg.chat_id, f"[ERROR] {error}")
+                return True
+            if not results:
+                await channel.send(msg.chat_id, f"No memory results for: {argument}")
+                return True
+            lines = [f"Found {len(results)} memory result(s):"]
+            for i, r in enumerate(results, 1):
+                excerpt = r.content[:180].replace("\n", " ")
+                lines.append(f"[{i}] {r.item_id} score={r.score:.3f} {excerpt}...")
+            await channel.send(msg.chat_id, "\n".join(lines))
+            return True
+
+        if command == "inspect":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /memory inspect <id>")
+                return True
+            item, error = self._rag_manager.inspect_memory(argument, ctx=ctx_dict)
+            if error or item is None:
+                await channel.send(msg.chat_id, f"[ERROR] {error or 'memory not found'}")
+                return True
+            await channel.send(
+                msg.chat_id,
+                f"Memory: {item.item_id}\n"
+                f"Type: {item.source_type}\n"
+                f"Scope: {item.scope_type}:{item.scope_id}\n"
+                f"Status: {item.status}\n"
+                f"Pinned: {item.pinned}\n"
+                f"Confidence: {item.confidence}",
+            )
+            return True
+
+        if command == "candidates":
+            candidates = self._rag_manager.list_memory_candidates()
+            if not candidates:
+                await channel.send(msg.chat_id, "No pending memory candidates found.")
+                return True
+            lines = [f"Pending memory candidates ({len(candidates)}):"]
+            for c in candidates[:20]:
+                lines.append(
+                    f"- {c['candidate_id']}: [{c.get('type') or c.get('memory_type')}] "
+                    f"{c.get('content_preview', '')}..."
+                )
+            await channel.send(msg.chat_id, "\n".join(lines))
+            return True
+
+        if command == "approve":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /memory approve <cand_id>")
+                return True
+            candidate_id = argument.split(maxsplit=1)[0]
+            item_id, error = self._rag_manager.approve_memory(candidate_id)
+            if error or item_id is None:
+                await channel.send(msg.chat_id, f"[ERROR] {error or 'approval failed'}")
+                return True
+            await channel.send(
+                msg.chat_id, f"Memory approved and committed: {item_id}"
+            )
+            return True
+
+        if command == "reject":
+            if not argument:
+                await channel.send(msg.chat_id, "Usage: /memory reject <cand_id>")
+                return True
+            candidate_id = argument.split(maxsplit=1)[0]
+            ok = self._rag_manager.reject_memory(candidate_id)
+            if not ok:
+                await channel.send(msg.chat_id, "[ERROR] reject failed or candidate not found")
+                return True
+            await channel.send(msg.chat_id, f"Memory candidate {candidate_id} rejected")
+            return True
+
+        await channel.send(
+            msg.chat_id,
+            f"Unknown /memory subcommand: {command}. Try /memory help",
         )
         return True
 

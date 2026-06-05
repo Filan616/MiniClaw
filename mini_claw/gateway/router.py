@@ -257,6 +257,40 @@ class Gateway:
                 extra={"chat_id": chat_id, "run_id": run_id},
             )
 
+    async def _send_progress(
+        self,
+        chat_id: str,
+        agent_id: str,
+        channel: Channel,
+        channel_name: str,
+        workspace_dir: str,
+        run_id: str,
+        text: str,
+    ) -> None:
+        """Phase 9.8: Send progress update to user and store with message_kind='progress'.
+
+        Called by AgentLoop periodically to show the user what's happening.
+        Fire-and-forget: failures are logged but do not interrupt execution.
+        """
+        try:
+            await channel.send(chat_id, text)
+            self._session_mgr.store_message(
+                chat_id=chat_id,
+                agent_id=agent_id,
+                role="assistant",
+                content=text,
+                run_id=run_id,
+                channel_name=channel_name,
+                workspace_dir=workspace_dir,
+                message_kind="progress",
+            )
+        except Exception:
+            logger.warning(
+                "Progress update send or storage failed",
+                exc_info=True,
+                extra={"chat_id": chat_id, "run_id": run_id},
+            )
+
     async def _send_command_prelude(
         self,
         msg: InboundMessage,
@@ -716,6 +750,15 @@ class Gateway:
                 channel_name=channel_name,
                 chat_search_manager=self._chat_search_manager,
                 on_prelude=lambda text: self._send_prelude(
+                    chat_id=msg.chat_id,
+                    agent_id=agent_id,
+                    channel=channel,
+                    channel_name=channel_name,
+                    workspace_dir=workspace_dir,
+                    run_id=run_id,
+                    text=text,
+                ),
+                on_progress=lambda text: self._send_progress(
                     chat_id=msg.chat_id,
                     agent_id=agent_id,
                     channel=channel,

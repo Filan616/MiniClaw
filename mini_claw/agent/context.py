@@ -29,3 +29,4 @@ class AgentContext:
     chat_search_manager: Any = None  # Phase 9 M9.1: ChatSearchManager instance
     on_prelude: Callable[[str], Awaitable[None]] | None = None  # Phase 9.7: Progressive response callback
     prelude_max_length: int = 120  # Phase 9.7: Max prelude length before truncation
+    on_progress: Callable[[str], Awaitable[None]] | None = None  # Phase 9.8: Progress update callback

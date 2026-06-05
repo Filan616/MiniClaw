@@ -18,8 +18,60 @@ from mini_claw.providers.base import Provider
 from mini_claw.tools.registry import ToolContext, ToolRegistry
 
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 50
+# Send progress updates to user after N iterations (0 = disabled)
+PROGRESS_NOTIFY_INTERVAL = 3
 logger = logging.getLogger(__name__)
+
+
+async def _send_progress_update(
+    run: AgentRun,
+    ctx: AgentContext,
+    iteration: int,
+    last_tool: str | None = None,
+) -> None:
+    """Send a progress update to the user showing what the agent is doing."""
+    if not ctx.on_progress:
+        return
+
+    progress_msg = f"🔄 正在处理中（第 {iteration} 轮）"
+    if last_tool:
+        progress_msg += f" - 上次调用: {last_tool}"
+
+    try:
+        await ctx.on_progress(progress_msg)
+    except Exception:
+        logger.warning("Progress update failed", exc_info=True)
+
+
+def _detect_tool_call_loop(run: AgentRun, lookback: int = 5) -> tuple[bool, str | None]:
+    """Detect if the agent is stuck in a tool call loop.
+
+    Returns:
+        (is_looping, tool_name): True if same tool called repeatedly without success.
+    """
+    if len(run.tool_call_history) < lookback:
+        return False, None
+
+    # Check last N calls
+    recent = run.tool_call_history[-lookback:]
+    tool_names = [name for name, success in recent]
+
+    # If same tool called 3+ times in last 5 calls, and majority failed
+    from collections import Counter
+    tool_counts = Counter(tool_names)
+    most_common_tool, count = tool_counts.most_common(1)[0]
+
+    if count >= 3:
+        # Check success rate for this tool in recent calls
+        tool_results = [success for name, success in recent if name == most_common_tool]
+        success_rate = sum(tool_results) / len(tool_results) if tool_results else 0
+
+        # Loop detected if tool called 3+ times with <50% success rate
+        if success_rate < 0.5:
+            return True, most_common_tool
+
+    return False, None
 
 
 class RunOutcome:
@@ -49,6 +101,7 @@ class AgentRun:
     written_scripts: dict[str, str] = field(default_factory=dict)
     rag_injected: bool = False  # Phase 8 M3: prevents double-injection across iterations
     prelude_sent: bool = False  # Phase 9.7: track if prelude already sent
+    tool_call_history: list[tuple[str, bool]] = field(default_factory=list)  # Phase 9.8: (tool_name, success)
 
 
 def _call_signature(call_name: str, call_args: dict[str, Any]) -> str:
@@ -612,6 +665,30 @@ async def run_agent_step(
 
     while run.iterations < MAX_ITERATIONS:
         run.iterations += 1
+
+        # Phase 9.8 M1: Send progress update to user
+        if PROGRESS_NOTIFY_INTERVAL > 0 and run.iterations % PROGRESS_NOTIFY_INTERVAL == 0:
+            last_tool = run.tool_call_history[-1][0] if run.tool_call_history else None
+            await _send_progress_update(run, ctx, run.iterations, last_tool)
+
+        # Phase 9.8 M2: Detect tool call loops
+        is_looping, loop_tool = _detect_tool_call_loop(run)
+        if is_looping:
+            # Inject a system message telling LLM to change strategy
+            loop_warning = (
+                f"⚠️ 系统提示：你已经连续多次调用 `{loop_tool}` 工具但未成功。"
+                f"请换一个不同的方法或工具来解决问题，不要再重复调用 `{loop_tool}`。"
+            )
+            run.messages.append({
+                "role": "system",
+                "content": loop_warning,
+            })
+            logger.warning(
+                "Tool call loop detected: %s called %d times in recent history",
+                loop_tool,
+                sum(1 for name, _ in run.tool_call_history[-5:] if name == loop_tool)
+            )
+
         # Tool calls are materially more reliable in non-streaming mode for
         # OpenAI-compatible providers such as DeepSeek: streamed tool calls can
         # arrive as partial name/arguments deltas and older parsers may lose or
@@ -625,6 +702,19 @@ async def run_agent_step(
             stream=use_stream,
             stream_callback=stream_callback if use_stream else None,
         )
+
+        # Phase 9.8 M5: Send every LLM text response to user immediately (if not already sent as prelude)
+        # Prelude is sent later (line ~730) only for first tool call with text
+        # For non-tool-call responses or subsequent iterations, send text here
+        should_send_immediately = (
+            response.text and ctx.on_progress and
+            (not response.tool_calls or run.prelude_sent)  # Not first tool call OR prelude already sent
+        )
+        if should_send_immediately:
+            try:
+                await ctx.on_progress(response.text)
+            except Exception:
+                logger.warning("Failed to send intermediate LLM response", exc_info=True)
 
         # No tool calls -> check for hallucination before marking complete
         if not response.tool_calls or response.finish_reason != "tool_calls":
@@ -867,9 +957,13 @@ async def run_agent_step(
 
             try:
                 result = await tool.handler(**tc.arguments, ctx=tool_ctx)
+                # Phase 9.8 M2: Record successful tool call
+                run.tool_call_history.append((tc.name, True))
             except TypeError as exc:
                 result = f"[error] tool {tc.name} rejected arguments: {exc}"
+                run.tool_call_history.append((tc.name, False))
             except Exception as exc:
+                run.tool_call_history.append((tc.name, False))
                 if result_processor:
                     result = result_processor.process_error(exc)
                 else:

@@ -18,6 +18,9 @@ channels_feishu:
   enabled: false
   app_id: "cli_xxx"
   app_secret: "your-app-secret"
+  health_check_interval_sec: 60
+  restart_on_disconnect: true
+  idle_restart_seconds: 0
 
 # 新版多通道配置。若留空，load_config 会根据 channels_feishu 自动生成 feishu channel。
 channels:
@@ -27,6 +30,9 @@ channels:
     options:
       app_id: "cli_xxx"
       app_secret: "your-app-secret"
+      health_check_interval_sec: 60
+      restart_on_disconnect: true
+      idle_restart_seconds: 0
 
 # ============================================================
 # HTTP Server

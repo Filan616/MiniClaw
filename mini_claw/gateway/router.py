@@ -215,6 +215,12 @@ class Gateway:
             f"  last_message_type: {status.get('last_message_type') or '-'}",
             f"  ws_exited_at: {fmt_ts(status.get('ws_exited_at'))}",
             f"  ws_exception: {status.get('ws_exception') or '-'}",
+            f"  restart_on_disconnect: {status.get('restart_on_disconnect')}",
+            f"  health_check_interval_sec: {status.get('health_check_interval_sec')}",
+            f"  idle_restart_seconds: {status.get('idle_restart_seconds')}",
+            f"  restart_count: {status.get('restart_count', 0)}",
+            f"  last_restart_at: {fmt_ts(status.get('last_restart_at'))}",
+            f"  last_restart_reason: {status.get('last_restart_reason') or '-'}",
         ]
 
     async def _send_prelude(

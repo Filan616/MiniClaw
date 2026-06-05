@@ -40,6 +40,9 @@ class ChannelManager:
                 options={
                     "app_id": feishu.app_id,
                     "app_secret": feishu.app_secret,
+                    "health_check_interval_sec": feishu.health_check_interval_sec,
+                    "restart_on_disconnect": feishu.restart_on_disconnect,
+                    "idle_restart_seconds": feishu.idle_restart_seconds,
                 },
             )
         ]
@@ -60,6 +63,9 @@ class ChannelManager:
                 name=cfg.name,
                 app_id=cfg.options.get("app_id", ""),
                 app_secret=cfg.options.get("app_secret", ""),
+                health_check_interval_sec=cfg.options.get("health_check_interval_sec", 60),
+                restart_on_disconnect=cfg.options.get("restart_on_disconnect", True),
+                idle_restart_seconds=cfg.options.get("idle_restart_seconds", 0),
             )
         if cfg.type == "cli":
             return cls(name=cfg.name)

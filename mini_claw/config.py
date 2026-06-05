@@ -79,6 +79,9 @@ class FeishuChannelConfig(BaseModel):
     enabled: bool = False
     app_id: str = ""
     app_secret: str = ""
+    health_check_interval_sec: int = 60
+    restart_on_disconnect: bool = True
+    idle_restart_seconds: int = 0
 
 
 class ChannelConfig(BaseModel):
@@ -582,6 +585,9 @@ def _normalize_channels(data: dict) -> dict:
                 "options": {
                     "app_id": feishu.get("app_id", ""),
                     "app_secret": feishu.get("app_secret", ""),
+                    "health_check_interval_sec": feishu.get("health_check_interval_sec", 60),
+                    "restart_on_disconnect": feishu.get("restart_on_disconnect", True),
+                    "idle_restart_seconds": feishu.get("idle_restart_seconds", 0),
                 },
             }
         ]

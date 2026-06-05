@@ -49,11 +49,17 @@ class FeishuChannel(Channel):
         app_secret: str,
         name: str = "feishu",
         log_level: lark.LogLevel = lark.LogLevel.INFO,
+        health_check_interval_sec: int = 60,
+        restart_on_disconnect: bool = True,
+        idle_restart_seconds: int = 0,
     ) -> None:
         super().__init__(name=name)
         self.app_id = app_id
         self.app_secret = app_secret
         self._log_level = log_level
+        self._health_check_interval_sec = max(5, int(health_check_interval_sec or 60))
+        self._restart_on_disconnect = bool(restart_on_disconnect)
+        self._idle_restart_seconds = max(0, int(idle_restart_seconds or 0))
 
         self._tenant_token: str | None = None
         self._token_expires_at: float = 0
@@ -81,8 +87,12 @@ class FeishuChannel(Channel):
         self._malformed_count: int = 0
         self._ws_exited_at: float | None = None
         self._ws_exception: str = ""
+        self._restart_count: int = 0
+        self._last_restart_at: float | None = None
+        self._last_restart_reason: str = ""
         self._health_lock = threading.Lock()
         self._health_task: asyncio.Task | None = None
+        self._restart_lock: asyncio.Lock = asyncio.Lock()
 
         # Streaming state: track active stream per chat
         self._active_stream: dict[str, dict[str, Any]] = {}
@@ -278,21 +288,29 @@ class FeishuChannel(Channel):
             return
 
         self._main_loop = asyncio.get_running_loop()
-        with self._health_lock:
-            self._started_at = time.time()
-            self._ws_exited_at = None
-            self._ws_exception = ""
+        self._start_ws_thread()
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(self._health_monitor_loop())
+        logger.info("Feishu 长连接已启动 (app_id=%s)", self.app_id)
 
-        handler = (
+    def _build_event_handler(self) -> Any:
+        return (
             lark.EventDispatcherHandler.builder("", "", self._log_level)
             .register_p2_im_message_receive_v1(self._on_message_event)
             .register_p2_card_action_trigger(self._on_card_action_event)
             .build()
         )
+
+    def _start_ws_thread(self) -> None:
+        with self._health_lock:
+            self._started_at = time.time()
+            self._ws_exited_at = None
+            self._ws_exception = ""
+
         self._ws_client = lark.ws.Client(
             self.app_id,
             self.app_secret,
-            event_handler=handler,
+            event_handler=self._build_event_handler(),
             log_level=self._log_level,
         )
 
@@ -302,9 +320,6 @@ class FeishuChannel(Channel):
             daemon=True,
         )
         self._ws_thread.start()
-        if self._health_task is None or self._health_task.done():
-            self._health_task = asyncio.create_task(self._health_monitor_loop())
-        logger.info("Feishu 长连接已启动 (app_id=%s)", self.app_id)
 
     async def stop(self) -> None:
         """Best-effort shutdown. The SDK does not expose a clean stop, so the
@@ -345,14 +360,14 @@ class FeishuChannel(Channel):
         """Periodically log inbound health so silent drops are visible."""
         try:
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(self._health_check_interval_sec)
                 status = self.health_status()
                 idle = status.get("idle_seconds")
                 idle_text = "never" if idle is None else f"{idle:.0f}s"
                 log = logger.warning if idle is not None and idle >= 300 else logger.info
                 log(
                     "Feishu 长连接健康: thread_alive=%s received=%s idle=%s "
-                    "last_event=%s last_chat=%s exited_at=%s exception=%s",
+                    "last_event=%s last_chat=%s exited_at=%s exception=%s restarts=%s",
                     status["ws_thread_alive"],
                     status["received_count"],
                     idle_text,
@@ -360,9 +375,41 @@ class FeishuChannel(Channel):
                     status["last_chat_id"] or "-",
                     status["ws_exited_at"] or "-",
                     status["ws_exception"] or "-",
+                    status["restart_count"],
                 )
+                await self._restart_if_needed(status)
         except asyncio.CancelledError:
             return
+
+    def _restart_reason(self, status: dict[str, Any]) -> str | None:
+        if not self._restart_on_disconnect:
+            return None
+        if status.get("ws_exited_at") is not None:
+            return "ws_exited"
+        if not status.get("ws_thread_alive"):
+            return "ws_thread_not_alive"
+        idle = status.get("idle_seconds")
+        if self._idle_restart_seconds > 0 and idle is not None and idle >= self._idle_restart_seconds:
+            return f"idle_timeout_{self._idle_restart_seconds}s"
+        return None
+
+    async def _restart_if_needed(self, status: dict[str, Any] | None = None) -> bool:
+        status = status or self.health_status()
+        reason = self._restart_reason(status)
+        if reason is None:
+            return False
+        async with self._restart_lock:
+            fresh_status = self.health_status()
+            fresh_reason = self._restart_reason(fresh_status)
+            if fresh_reason is None:
+                return False
+            logger.warning("Feishu 长连接将自动重启: reason=%s", fresh_reason)
+            self._start_ws_thread()
+            with self._health_lock:
+                self._restart_count += 1
+                self._last_restart_at = time.time()
+                self._last_restart_reason = fresh_reason
+            return True
 
     def health_status(self) -> dict[str, Any]:
         """Return a snapshot of long-connection inbound health."""
@@ -390,6 +437,12 @@ class FeishuChannel(Channel):
                 "last_message_type": self._last_message_type,
                 "ws_exited_at": int(self._ws_exited_at) if self._ws_exited_at is not None else None,
                 "ws_exception": self._ws_exception,
+                "restart_on_disconnect": self._restart_on_disconnect,
+                "health_check_interval_sec": self._health_check_interval_sec,
+                "idle_restart_seconds": self._idle_restart_seconds,
+                "restart_count": self._restart_count,
+                "last_restart_at": int(self._last_restart_at) if self._last_restart_at is not None else None,
+                "last_restart_reason": self._last_restart_reason,
             }
 
     def _record_message_event(self, msg: InboundMessage, message_type: str) -> None:

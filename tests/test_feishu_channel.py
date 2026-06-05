@@ -130,3 +130,55 @@ async def test_on_card_action_dispatches_to_main_loop():
     assert captured == [{"action": "approve", "approval_id": "ap_001"}]
     # Lark expects a P2CardActionTriggerResponse to ack the trigger.
     assert response is not None
+
+
+@pytest.mark.asyncio
+async def test_health_check_restarts_when_ws_thread_is_not_alive(monkeypatch):
+    channel = FeishuChannel(
+        app_id="cli_test",
+        app_secret="secret",
+        health_check_interval_sec=60,
+        restart_on_disconnect=True,
+    )
+    starts: list[str] = []
+
+    def fake_start_ws_thread() -> None:
+        starts.append("started")
+
+    monkeypatch.setattr(channel, "_start_ws_thread", fake_start_ws_thread)
+
+    restarted = await channel._restart_if_needed(
+        {
+            "ws_thread_alive": False,
+            "ws_exited_at": None,
+            "idle_seconds": None,
+        }
+    )
+
+    assert restarted is True
+    assert starts == ["started"]
+    status = channel.health_status()
+    assert status["restart_count"] == 1
+    assert status["last_restart_reason"] == "ws_thread_not_alive"
+
+
+@pytest.mark.asyncio
+async def test_health_check_does_not_restart_when_disabled(monkeypatch):
+    channel = FeishuChannel(
+        app_id="cli_test",
+        app_secret="secret",
+        restart_on_disconnect=False,
+    )
+    starts: list[str] = []
+    monkeypatch.setattr(channel, "_start_ws_thread", lambda: starts.append("started"))
+
+    restarted = await channel._restart_if_needed(
+        {
+            "ws_thread_alive": False,
+            "ws_exited_at": None,
+            "idle_seconds": None,
+        }
+    )
+
+    assert restarted is False
+    assert starts == []

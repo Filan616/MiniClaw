@@ -1495,14 +1495,21 @@ InboundMessage(
 - `last_event_at` / `idle_seconds`：最近一次事件时间与空闲秒数。
 - `last_event_id` / `last_chat_id` / `last_sender_id` / `last_message_type`：最近事件摘要。
 - `ws_exited_at` / `ws_exception`：`Client.start()` 返回或异常退出信息。
+- `restart_count` / `last_restart_at` / `last_restart_reason`：自动重启次数与最近一次原因。
 
 `FeishuChannel.start()` 会启动一个 60 秒周期的健康日志任务：
 
 ```text
-Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... last_chat=...
+Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... last_chat=... restarts=0
 ```
 
 如果 `idle_seconds >= 300`，日志级别会升为 warning，提示“线程看起来还活着，但已经很久没有收到事件”。这能把“用户感觉没接收到”变成可观测状态，而不是靠重复发消息试运气。
+
+健康检查也支持自动重启：
+
+- 默认 `health_check_interval_sec=60`，每分钟检查一次。
+- 默认 `restart_on_disconnect=true`，当 WS thread 已死、或 `Client.start()` 返回/异常退出时，自动重建 `lark.ws.Client` 和后台线程。
+- 默认 `idle_restart_seconds=0`，不会因为“长时间没人发消息”误判掉线；如果需要，可以显式配置空闲超过 N 秒后重启。
 
 同时 Gateway 增加 `/feishu status`：
 
@@ -1512,7 +1519,7 @@ Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... la
 
 它不会进入 AgentLoop，也不会污染普通对话历史，而是直接返回当前 Feishu channel 的健康快照。注意：如果飞书事件完全没有推到 MiniClaw，`/feishu status` 这条消息本身也收不到；这时要看控制台周期性健康日志。
 
-当前仍未实现的是“线程退出后的自动重启”。第一版先做可观测性，确认问题到底是飞书未推、SDK 半失效、多实例竞争，还是 Gateway 之后的处理问题。
+第一版自动重启只处理“明确掉线”：线程死亡或 `Client.start()` 返回/异常。空闲重启默认关闭，因为安静时段没有消息不一定代表掉线。
 
 ---
 
@@ -5851,8 +5858,12 @@ self._received_count
 self._malformed_count
 self._ws_exited_at
 self._ws_exception
+self._restart_count
+self._last_restart_at
+self._last_restart_reason
 self._health_lock
 self._health_task
+self._restart_lock
 ```
 
 收到消息事件后调用 `_record_message_event()`：
@@ -5877,16 +5888,34 @@ self._last_message_type = message_type
     "idle_seconds": 43,
     "last_event_id": "...",
     "ws_exception": "",
+    "restart_count": 0,
+    "last_restart_reason": "",
 }
 ```
 
 `start()` 里启动 `_health_monitor_loop()`，每 60 秒打一次日志：
 
 ```text
-Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... last_chat=...
+Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... last_chat=... restarts=0
 ```
 
 如果 `idle_seconds >= 300`，日志级别升为 warning。这样即使飞书完全不推新消息，控制台也会周期性告诉你“线程还活着，但已经很久没收到事件”。
+
+同时新增自动重启策略：
+
+```yaml
+channels_feishu:
+  health_check_interval_sec: 60
+  restart_on_disconnect: true
+  idle_restart_seconds: 0
+```
+
+新版 `channels[].options` 也支持同样字段。默认行为：
+
+- 每 60 秒健康检查一次。
+- WS thread 不存活时自动重启。
+- `Client.start()` 返回或异常退出时自动重启。
+- `idle_restart_seconds=0` 表示不因空闲自动重启，避免无人发消息时误判。
 
 在 [mini_claw/gateway/router.py](mini_claw/gateway/router.py) 增加 `/feishu status`：
 
@@ -5910,6 +5939,12 @@ Feishu 长连接健康: thread_alive=True received=12 idle=43s last_event=... la
 - `last_message_type`
 - `ws_exited_at`
 - `ws_exception`
+- `restart_on_disconnect`
+- `health_check_interval_sec`
+- `idle_restart_seconds`
+- `restart_count`
+- `last_restart_at`
+- `last_restart_reason`
 
 这个命令在 `/bypass` 之后、`/safe` 之前处理：
 
@@ -5940,20 +5975,23 @@ Feishu 长连接健康: thread_alive=True received=0 idle=never ...
 
 ```powershell
 pytest tests/test_feishu_channel.py tests/test_channel_manager.py -q
-python -m compileall mini_claw\channels\feishu.py mini_claw\gateway\router.py
+python -m compileall mini_claw\channels\feishu.py mini_claw\channels\manager.py mini_claw\gateway\router.py mini_claw\config.py
 ```
 
 测试覆盖：
 
 - `tests/test_feishu_channel.py`：收到消息后 `health_status()` 更新 `received_count/last_event_id/last_chat_id/last_sender_id/last_message_type`。
+- `tests/test_feishu_channel.py`：WS thread 不存活时自动重启；`restart_on_disconnect=false` 时不重启。
 - `tests/test_channel_manager.py::test_gateway_handles_feishu_status_command`：`/feishu status` 直接返回健康状态并标记事件 handled。
+- `tests/test_channel_manager.py`：旧 `channels_feishu` 配置能透传健康检查字段到新版 `channels[].options`。
 
 **经验**：
 
 - **“已启动”不等于“健康”**：长连接线程活着，只能说明 `Client.start()` 没退出，不能证明飞书事件仍在投递。
 - **先定义接收边界**：`飞书消息收到` 是 MiniClaw 入站边界；没有这行，就不要从 AgentLoop、工具、RAG 方向排查。
 - **诊断命令也依赖入站链路**：`/feishu status` 收不到时，不代表命令坏了，反而说明飞书事件没有进入 MiniClaw；此时要看周期健康日志。
-- **第一版先做可观测性**：自动重连、SDK 重建和多实例检测可以后续做；先把 `last_event_at/idle/received_count` 暴露出来，才能判断该修哪一层。
+- **自动重启只处理明确掉线**：线程死亡或 `Client.start()` 返回/异常才重启；单纯空闲默认不重启，避免安静时段误判。
+- **配置要同时支持新旧形态**：`channels_feishu` 和 `channels[].options` 都能设置健康检查字段，避免用户迁移配置时丢能力。
 
 ### 57.15 `open_app` 受控打开应用工具
 
@@ -6128,10 +6166,10 @@ python -m compileall mini_claw\tools\open_app.py mini_claw\tools\builtin.py mini
 
 ---
 
-**文档版本**：v4.8
+**文档版本**：v4.9
 
 **最后更新**：2026-06-05
 
-**对应代码状态**：Phase 0-8.3.5 完整落地，Phase 9 Messages / Context / Memory 隔离地基与近期小修已进入主线；新增 `current_time` 实时时间工具、AgentLoop `[Current Time]` 注入、`/feishu status` 长连接健康监控、`open_app` 受控打开应用工具；当前 `pytest --collect-only -q` 约 685+ tests collected，本机 `pytest tests/ -q` 预计 681+ passed + 4 skipped
+**对应代码状态**：Phase 0-8.3.5 完整落地，Phase 9 Messages / Context / Memory 隔离地基与近期小修已进入主线；新增 `current_time` 实时时间工具、AgentLoop `[Current Time]` 注入、`/feishu status` 长连接健康监控、掉线自动重启、`open_app` 受控打开应用工具；当前 `pytest --collect-only -q` 约 685+ tests collected，本机 `pytest tests/ -q` 预计 681+ passed + 4 skipped
 
 **维护者**：MiniClaw 项目组

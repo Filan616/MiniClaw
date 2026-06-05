@@ -81,6 +81,9 @@ channels_feishu:
   enabled: true
   app_id: app
   app_secret: secret
+  health_check_interval_sec: 30
+  restart_on_disconnect: false
+  idle_restart_seconds: 600
 """,
         encoding="utf-8",
     )
@@ -90,6 +93,9 @@ channels_feishu:
     assert cfg.channels[0].type == "feishu"
     assert cfg.channels[0].enabled is True
     assert cfg.channels[0].options["app_id"] == "app"
+    assert cfg.channels[0].options["health_check_interval_sec"] == 30
+    assert cfg.channels[0].options["restart_on_disconnect"] is False
+    assert cfg.channels[0].options["idle_restart_seconds"] == 600
 
 
 def test_new_channels_config_takes_priority(tmp_path: Path):

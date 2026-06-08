@@ -6166,10 +6166,217 @@ python -m compileall mini_claw\tools\open_app.py mini_claw\tools\builtin.py mini
 
 ---
 
-**文档版本**：v4.9
+## 29. Phase 9.8: Agent Loop 进度透明化与循环检测
 
-**最后更新**：2026-06-05
+**实现日期**: 2026-06-05  
+**Commit**: `8344270`
 
-**对应代码状态**：Phase 0-8.3.5 完整落地，Phase 9 Messages / Context / Memory 隔离地基与近期小修已进入主线；新增 `current_time` 实时时间工具、AgentLoop `[Current Time]` 注入、`/feishu status` 长连接健康监控、掉线自动重启、`open_app` 受控打开应用工具；当前 `pytest --collect-only -q` 约 685+ tests collected，本机 `pytest tests/ -q` 预计 681+ passed + 4 skipped
+### 问题背景
+
+用户在使用 MiniClaw 时遇到以下问题：
+
+1. **黑盒等待**：LLM 处理任务时，用户只看到开头和结尾，中间过程完全不可见
+2. **工具调用循环**：LLM 陷入死循环，反复调用同一个失败的工具（如 `list_directory`），最终触发 max_turns 限制
+3. **工具选择错误**：LLM 在"打开微信"时不调用 `open_app`，而是用 `run_shell`/`list_directory` 查找路径
+4. **历史污染**：对话历史太长（1558 条消息），LLM 学到了错误模式，直接回复"没有安装"而不尝试工具调用
+
+### 解决方案
+
+#### M1: 中间进度通知
+
+每 3 轮迭代发送进度更新给用户：
+
+```python
+# mini_claw/agent/loop.py
+PROGRESS_NOTIFY_INTERVAL = 3  # 每 3 轮发送一次
+
+async def _send_progress_update(run, ctx, iteration, last_tool):
+    if not ctx.on_progress:
+        return
+    progress_msg = f"🔄 正在处理中（第 {iteration} 轮）"
+    if last_tool:
+        progress_msg += f" - 上次调用: {last_tool}"
+    await ctx.on_progress(progress_msg)
+
+# 主循环中
+while run.iterations < MAX_ITERATIONS:
+    run.iterations += 1
+    if PROGRESS_NOTIFY_INTERVAL > 0 and run.iterations % PROGRESS_NOTIFY_INTERVAL == 0:
+        last_tool = run.tool_call_history[-1][0] if run.tool_call_history else None
+        await _send_progress_update(run, ctx, run.iterations, last_tool)
+```
+
+**效果**：用户每 3 轮看到 `🔄 正在处理中（第 3 轮） - 上次调用: run_shell`，不再盲等。
+
+#### M2: 工具调用循环检测
+
+检测同一工具连续 3+ 次失败，自动注入 system message 警告 LLM：
+
+```python
+# AgentRun 新增字段
+@dataclass
+class AgentRun:
+    tool_call_history: list[tuple[str, bool]] = field(default_factory=list)  # (tool_name, success)
+
+# 循环检测函数
+def _detect_tool_call_loop(run: AgentRun, lookback: int = 5):
+    """检测最近 lookback 轮中，是否有工具被调用 3+ 次且成功率 < 50%"""
+    if len(run.tool_call_history) < lookback:
+        return False, None
+    
+    recent = run.tool_call_history[-lookback:]
+    tool_counts = Counter([name for name, _ in recent])
+    most_common_tool, count = tool_counts.most_common(1)[0]
+    
+    if count >= 3:
+        tool_results = [success for name, success in recent if name == most_common_tool]
+        success_rate = sum(tool_results) / len(tool_results)
+        if success_rate < 0.5:
+            return True, most_common_tool
+    return False, None
+
+# 主循环中注入警告
+is_looping, loop_tool = _detect_tool_call_loop(run)
+if is_looping:
+    run.messages.append({
+        "role": "system",
+        "content": f"⚠️ 系统提示：你已经连续多次调用 `{loop_tool}` 工具但未成功。请换一个不同的方法或工具来解决问题。"
+    })
+```
+
+**效果**：防止 LLM 无限重试同一失败工具，浪费 token。
+
+#### M3: 每轮 LLM 回复立即发送
+
+用户要求看到**所有**中间思考过程：
+
+```python
+response = await provider.chat(...)
+
+# 如果不是 prelude（prelude 会单独处理），立即发送
+should_send_immediately = (
+    response.text and ctx.on_progress and
+    (not response.tool_calls or run.prelude_sent)
+)
+if should_send_immediately:
+    await ctx.on_progress(response.text)
+```
+
+**效果**：LLM 每轮的文本回复都立即发送，完全透明。
+
+#### M4: System Prompt 强化
+
+在 `config.yaml` 中添加：
+
+```yaml
+## 🚀 打开应用的正确方式
+当用户要求打开应用时，**必须直接调用 open_app 工具**。
+
+**严格禁止**：
+- ❌ 用 run_shell 执行 start 命令
+- ❌ 用 list_directory 查找安装路径
+- ❌ 声称"没有安装"而不调用 open_app
+- ❌ 基于历史记录推测"没有安装"就放弃尝试
+
+**强制要求**：
+- ✅ 即使历史记录显示"找不到"，也**必须**再次调用 open_app
+- ✅ 用户每次请求"打开X"，都必须调用 open_app(app="X")
+- ✅ 只有 open_app 返回错误后，才能告诉用户"没有安装"
+```
+
+**效果**：强制 LLM 在打开应用时使用正确的工具。
+
+### 测试覆盖
+
+新增 `tests/test_agent_loop_progress.py`，包含 10 个测试用例：
+
+- 循环检测：无历史、不足lookback、重复失败、混合工具、边界条件
+- 进度通知：无回调、有回调、回调异常
+- 集成测试：验证 system message 注入
+
+全部通过：`10 passed in 0.39s`
+
+### 核心设计
+
+#### 异步回调设计
+
+```python
+# AgentContext 定义
+on_progress: Callable[[str], Awaitable[None]] | None = None
+
+# Gateway 绑定
+ctx = AgentContext(
+    on_progress=lambda text: self._send_progress(
+        chat_id, agent_id, channel, channel_name, workspace_dir, run_id, text
+    ),
+)
+
+# AgentLoop 调用
+await ctx.on_progress(progress_msg)
+```
+
+**优点**：解耦、灵活、优雅（Fire-and-forget）
+
+#### 循环检测算法
+
+```python
+# 统计最近 5 次调用
+recent = run.tool_call_history[-5:]
+tool_counts = Counter([name for name, _ in recent])
+
+# 某工具调用 3+ 次且成功率 < 50% → 循环
+most_common_tool, count = tool_counts.most_common(1)[0]
+if count >= 3:
+    success_rate = sum([success for name, success in recent if name == most_common_tool]) / count
+    if success_rate < 0.5:
+        return True, most_common_tool
+```
+
+**为什么不是"连续 N 次同一工具"**：太严格，中间穿插其他工具调用就检测不到。例如 `[list_dir, read_file, list_dir, read_file, list_dir]` 应该检测到 `list_dir` 循环。
+
+### 效果对比
+
+**优化前**：
+```
+17:03:49 用户: 帮我打开微信
+17:03:50 LLM: 好的主人，让我先看看微信有没有安装～🔍
+[10 秒沉默]
+17:04:00 LLM: 抱歉，我在 10 轮对话后仍未能完成任务
+```
+
+**优化后**：
+```
+17:41:33 用户: 帮我打开微信
+17:41:35 LLM: 好的主人，噜噜直接帮你打开微信！📱
+17:41:37 [调用 open_app(app="微信")]
+17:41:40 🔄 正在处理中（第 3 轮） - 上次调用: open_app
+17:41:42 LLM: 找到微信了！正在启动...
+17:41:45 LLM: ✅ 微信已成功打开！
+```
+
+### 经验教训
+
+1. **System Prompt 的重要性**：LLM 倾向于用"熟悉"的工具，需要明确禁止某些做法、强制要求某些做法
+2. **对话历史的影响**：1558 条历史消息导致 LLM 学到错误模式，System prompt 权重 < 历史记录权重
+3. **用户体验 vs 技术优雅**：用户要求所有中间思考都可见，即使这会导致消息轰炸
+4. **测试驱动开发的价值**：10 个测试用例发现了边界条件问题（`count > 3` → `count >= 3`）
+
+### 文件修改
+
+| 文件 | 修改内容 |
+|:---|:---|
+| `mini_claw/agent/context.py` | 添加 `on_progress` 回调 |
+| `mini_claw/agent/loop.py` | 进度通知、循环检测、每轮消息发送 |
+| `mini_claw/gateway/router.py` | `_send_progress` 实现 |
+| `config.yaml` | System prompt 强化 |
+| `tests/test_agent_loop_progress.py` | 10 个测试用例 |
+
+---
+
+**文档版本**：v4.10
+
+**最后更新**：2026-06-08
+
+**对应代码状态**：Phase 0-8.3.5 完整落地，Phase 9 Messages / Context / Memory 隔离地基与近期小修已进入主线；**Phase 9.8 Agent Loop 进度透明化与循环检测已完成** ✅；新增 `current_time` 实时时间工具、AgentLoop `[Current Time]` 注入、`/feishu status` 长连接健康监控、掉线自动重启、`open_app` 受控打开应用工具；当前 `pytest --collect-only -q` 约 695+ tests collected，本机 `pytest tests/ -q` 预计 691+ passed + 4 skipped
 
 **维护者**：MiniClaw 项目组

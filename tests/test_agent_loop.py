@@ -177,6 +177,34 @@ async def test_agent_loop_duplicate_detection(
 
 
 @pytest.mark.asyncio
+async def test_need_approval_uses_tool_permission_level(
+    agent_run, mock_provider, mock_registry, mock_result_processor, ctx
+):
+    mock_provider.chat.return_value = LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_1", name="run_shell", arguments={"cmd": "rm file"})],
+        finish_reason="tool_calls",
+        raw={},
+    )
+    tool = MagicMock()
+    tool.name = "run_shell"
+    tool.permission_level = "L3"
+    mock_registry.get.return_value = tool
+
+    mock_gate = MagicMock()
+    mock_gate.evaluate.return_value = Decision(action="need_approval", reason="requires approval")
+
+    result = await run_agent_step(
+        agent_run, mock_provider, mock_registry, mock_gate, mock_result_processor, ctx
+    )
+
+    assert result.status == RunOutcome.SUSPENDED
+    assert result.pending_approval_id
+    pending = json.loads(result.pending_tool_call)
+    assert pending["level"] == "L3"
+
+
+@pytest.mark.asyncio
 async def test_parallel_precheck_splits_by_evaluate_not_metadata(
     agent_run, mock_provider, mock_registry, mock_result_processor, ctx
 ):

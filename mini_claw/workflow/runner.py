@@ -498,7 +498,78 @@ class WorkflowRunner:
             session_id=ctx.session_id,
             channel_name=ctx.channel_name,
             chat_search_manager=getattr(ctx, "chat_search_manager", None),
+            on_react_update=getattr(ctx, "on_react_update", None),
+            react_user_updates_enabled=getattr(ctx, "react_user_updates_enabled", True),
+            react_user_update_mode=getattr(ctx, "react_user_update_mode", "normal"),
+            react_user_update_max_chars=getattr(ctx, "react_user_update_max_chars", 160),
         )
+
+        # Phase 10 M10.3: resolve a per-node ReActPolicy. High-risk nodes
+        # and any node with an explicit ``react_policy`` override get
+        # strict mode (every-iteration Reflection); everything else
+        # inherits the parent ``ctx.react_policy`` (or controlled defaults).
+        from mini_claw.agent.react_policy import resolve_react_policy
+
+        # Phase 10 §6: prefer the unified ``cfg.agent.react`` block; fall
+        # back to ``cfg.workflow.react`` (legacy) and finally to the
+        # parent ctx's policy so resolved knobs are deterministic.
+        agent_react_cfg = None
+        full_app_cfg = getattr(self._config, "_app_config", None)
+        if full_app_cfg is not None:
+            agent_react_cfg = getattr(getattr(full_app_cfg, "agent", None), "react", None)
+        if agent_react_cfg is None:
+            agent_react_cfg = getattr(self._config, "react", None)
+
+        sub_ctx.react_policy = resolve_react_policy(
+            config=agent_react_cfg,
+            workflow_node=node,
+            task_risk=node.risk_level,
+            user_override=None,
+        )
+
+        # Phase 10 §6: when ``risk_level == 'high'`` and there is no node
+        # override, apply the workflow.high_risk_node_defaults block.
+        high_risk = getattr(self._config, "high_risk_node_defaults", None)
+        if (
+            node.risk_level == "high"
+            and node.react_policy is None
+            and high_risk is not None
+        ):
+            if getattr(high_risk, "react_mode", None) == "strict":
+                sub_ctx.react_policy.apply_high_risk_defaults()
+            if getattr(high_risk, "reflect_every_iteration", False):
+                sub_ctx.react_policy.reflect_every_iteration = True
+
+        # Phase 10: propagate goal anchor + react_user_update knobs from
+        # the parent context (which the router already populated from
+        # cfg.agent), so subagents inherit the same display contract.
+        sub_ctx.goal_anchor_enabled = getattr(ctx, "goal_anchor_enabled", True)
+        sub_ctx.goal_anchor_max_summary_chars = getattr(
+            ctx, "goal_anchor_max_summary_chars", 800
+        )
+        sub_ctx.goal_anchor_mark_untrusted = getattr(
+            ctx, "goal_anchor_mark_untrusted", True
+        )
+        sub_ctx.goal_anchor_detect_policy = getattr(
+            ctx, "goal_anchor_detect_policy", True
+        )
+
+        if ctx.audit_logger:
+            try:
+                ctx.audit_logger.log_security_event(
+                    event_type="react_policy_resolved",
+                    details={
+                        "workflow_id": workflow_id,
+                        "node_id": node.id,
+                        "mode": sub_ctx.react_policy.mode,
+                        "reflect_every_iteration": sub_ctx.react_policy.reflect_every_iteration,
+                        "task_risk": node.risk_level,
+                    },
+                    chat_id=ctx.chat_id,
+                    agent_id=ctx.agent_id,
+                )
+            except Exception:
+                pass
         run = AgentRun(
             id=run_id,
             chat_id=ctx.chat_id,
@@ -506,6 +577,7 @@ class WorkflowRunner:
             status=RunOutcome.DONE,
             messages=[{"role": "user", "content": prompt.user_prompt}],
             allowed_tools=prompt.allowed_tools,
+            original_goal_raw=prompt.user_prompt,
         )
 
         timed_out = False

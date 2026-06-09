@@ -38,6 +38,21 @@ class NodePromptSpec:
 
 
 @dataclass(slots=True)
+class ReactNodePolicy:
+    """Phase 10 M10.3: per-node ReAct policy override.
+
+    Attached to a :class:`WorkflowNode` to opt that node into strict
+    every-iteration Reflection or to keep it in the default controlled
+    mode. Always optional — node policies are layered on top of the
+    agent-level policy by :func:`mini_claw.agent.react_policy.resolve_react_policy`.
+    """
+
+    mode: Literal["controlled", "strict"] = "controlled"
+    reflect_every_iteration: bool | None = None
+    reflect_before_finalize: bool | None = None
+
+
+@dataclass(slots=True)
 class WorkflowNode:
     id: str
     type: WorkflowNodeType
@@ -51,6 +66,7 @@ class WorkflowNode:
     risk_level: WorkflowRiskLevel = "low"
     prompt_spec: NodePromptSpec | None = None
     timeout: int = 300
+    react_policy: ReactNodePolicy | None = None
 
 
 @dataclass(slots=True)
@@ -76,6 +92,16 @@ class WorkflowSpec:
         for node_data in data.get("nodes", []):
             prompt_data = node_data.get("prompt_spec")
             prompt_spec = NodePromptSpec(**prompt_data) if prompt_data else None
+            policy_data = node_data.get("react_policy")
+            react_policy = (
+                ReactNodePolicy(
+                    mode=policy_data.get("mode", "controlled"),
+                    reflect_every_iteration=policy_data.get("reflect_every_iteration"),
+                    reflect_before_finalize=policy_data.get("reflect_before_finalize"),
+                )
+                if isinstance(policy_data, dict)
+                else None
+            )
             nodes.append(
                 WorkflowNode(
                     id=node_data["id"],
@@ -90,6 +116,7 @@ class WorkflowSpec:
                     risk_level=node_data.get("risk_level", "low"),
                     prompt_spec=prompt_spec,
                     timeout=int(node_data.get("timeout", 300)),
+                    react_policy=react_policy,
                 )
             )
         return cls(

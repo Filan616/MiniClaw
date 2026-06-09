@@ -19,7 +19,11 @@ from mini_claw.tools.registry import ToolRegistry
 
 
 class DummyProvider(Provider):
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def chat(self, messages, tools=None, stream=False, stream_callback=None):
+        self.calls += 1
         return LLMResponse(text="hello from cli")
 
     def format_tools(self, tools):
@@ -250,5 +254,74 @@ async def test_gateway_handles_feishu_status_command(tmp_path: Path):
     event = db.fetchone(
         "SELECT status FROM processed_events WHERE event_id=?",
         ("evt_feishu_status",),
+    )
+    assert event["status"] == "handled"
+
+
+@pytest.mark.asyncio
+async def test_gateway_clear_command_clears_history_without_llm(tmp_path: Path):
+    cfg = AppConfig(
+        agents=[AgentConfig(id="default", tools=[])],
+        channels=[ChannelConfig(name="cli", type="cli", enabled=False)],
+    )
+    db = Database(tmp_path / "gateway.db")
+    workspace_manager = WorkspaceManager(tmp_path / "workspaces")
+    workspace_manager.load_workspaces(cfg.agents)
+    agent_manager = AgentManager(db, cfg, workspace_manager)
+    provider = DummyProvider()
+    provider_manager = ProviderManager(cfg, default_provider=provider)
+    channel_manager = ChannelManager(cfg)
+    registry = ToolRegistry()
+    permission_gate = PermissionGate(
+        PermissionPolicy(cfg.permissions),
+        ApprovalStore(db),
+    )
+
+    gateway = Gateway(
+        config=cfg,
+        storage=db,
+        provider=provider,
+        provider_manager=provider_manager,
+        registry=registry,
+        permission_gate=permission_gate,
+        result_processor=ToolResultProcessor(),
+        workspace_manager=workspace_manager,
+        agent_manager=agent_manager,
+        channel_manager=channel_manager,
+    )
+    channel_manager.set_gateway(gateway)
+    cli_channel = CaptureChannel(name="cli")
+    channel_manager.register_instance(cli_channel)
+
+    await gateway.handle_message(
+        InboundMessage(
+            channel_name="cli",
+            chat_id="cli_clear",
+            sender_id="tester",
+            text="hello",
+            event_id="evt_clear_seed",
+            timestamp=1,
+        )
+    )
+    assert provider.calls == 1
+    assert gateway._session_mgr.count_messages("cli_clear", "default", "cli") > 0
+
+    await gateway.handle_message(
+        InboundMessage(
+            channel_name="cli",
+            chat_id="cli_clear",
+            sender_id="tester",
+            text="/clear",
+            event_id="evt_clear",
+            timestamp=2,
+        )
+    )
+
+    assert provider.calls == 1
+    assert gateway._session_mgr.count_messages("cli_clear", "default", "cli") == 0
+    assert "已清理当前会话上下文" in cli_channel.sent[-1][1]
+    event = db.fetchone(
+        "SELECT status FROM processed_events WHERE event_id=?",
+        ("evt_clear",),
     )
     assert event["status"] == "handled"

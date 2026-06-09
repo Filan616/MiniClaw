@@ -418,6 +418,102 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
+        # Phase 10 M10.1: optional metadata_json on messages so react_update
+        # mirrors can carry their (update_id, step_id, event_type, ...) blob
+        # without needing a side-table join in the trace layer.
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN metadata_json TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Phase 10 (Goal-anchored Controlled ReAct Runtime): agent_runs columns
+        # for goal anchoring + final reflection snapshot, and the new
+        # react_steps / react_user_updates tables.
+        phase10_run_migrations = [
+            "ALTER TABLE agent_runs ADD COLUMN react_mode TEXT DEFAULT 'controlled'",
+            "ALTER TABLE agent_runs ADD COLUMN original_goal_raw TEXT",
+            "ALTER TABLE agent_runs ADD COLUMN original_goal_summary TEXT",
+            "ALTER TABLE agent_runs ADD COLUMN final_reflection_json TEXT",
+        ]
+        for migration in phase10_run_migrations:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+        try:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS react_steps (
+                    step_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+
+                    action_phase TEXT NOT NULL,
+
+                    assistant_content_hash TEXT,
+                    tool_calls_json TEXT,
+                    tool_call_refs_json TEXT,
+
+                    permission_decisions_json TEXT,
+
+                    observation_json TEXT,
+                    reflection_json TEXT,
+                    reflection_triggered INTEGER DEFAULT 0,
+                    reflection_reasons_json TEXT,
+
+                    user_updates_json TEXT,
+
+                    decision TEXT NOT NULL,
+                    status TEXT NOT NULL,
+
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_react_steps_run
+                ON react_steps(run_id, iteration);
+
+                CREATE INDEX IF NOT EXISTS idx_react_steps_chat_agent
+                ON react_steps(chat_id, agent_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS react_user_updates (
+                    update_id TEXT PRIMARY KEY,
+                    step_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+
+                    event_type TEXT NOT NULL,
+                    visible_level TEXT NOT NULL,
+                    is_important INTEGER DEFAULT 0,
+
+                    text_hash TEXT NOT NULL,
+                    redacted_text TEXT,
+
+                    send_status TEXT NOT NULL,
+                    channel_message_id TEXT,
+                    error TEXT,
+
+                    created_at INTEGER NOT NULL,
+                    sent_at INTEGER
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_react_updates_run
+                ON react_user_updates(run_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_react_updates_step
+                ON react_user_updates(step_id, created_at);
+                """
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            self._conn.rollback()
+
         # Rebuild task_state table with composite PK (channel_name, chat_id, agent_id)
         try:
             cursor = self._conn.execute(

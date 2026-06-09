@@ -206,6 +206,7 @@ class SessionManager:
         agent_id: str,
         channel_name: str = "feishu",
         include_preludes: bool = False,
+        include_react_updates: bool = False,
     ) -> list[dict[str, Any]]:
         """Get recent messages for context window construction.
 
@@ -221,11 +222,26 @@ class SessionManager:
 
         Phase 9.7: By default, filters out preludes (message_kind='prelude').
         Set include_preludes=True to include them.
+        Phase 10 M10.1: ``react_update`` rows are also filtered by default —
+        they are user-visible process messages, not part of the LLM context.
         """
         # Get all uncompacted messages ordered by id
         # Phase 9 P0.6: Strict channel_name matching enforced (legacy compatibility removed)
-        # Phase 9.7: Filter out preludes by default
-        kind_filter = "" if include_preludes else "AND COALESCE(message_kind, 'normal') != 'prelude' "
+        # Phase 9.7 + Phase 10: Filter out preludes and react_updates by default
+        excluded_kinds: list[str] = []
+        if not include_preludes:
+            excluded_kinds.append("prelude")
+        if not include_react_updates:
+            excluded_kinds.append("react_update")
+        if excluded_kinds:
+            placeholders = ",".join("?" for _ in excluded_kinds)
+            kind_filter = (
+                f"AND (message_kind IS NULL OR message_kind NOT IN ({placeholders})) "
+            )
+            kind_params: tuple = tuple(excluded_kinds)
+        else:
+            kind_filter = ""
+            kind_params = ()
         rows = self._storage.fetchall(
             "SELECT role, content, tool_calls, tool_call_id, is_compaction_summary "
             "FROM messages "
@@ -234,7 +250,7 @@ class SessionManager:
             f"{kind_filter}"
             "AND COALESCE(compacted, 0) = 0 "
             "ORDER BY id ASC",
-            (chat_id, agent_id, channel_name),
+            (chat_id, agent_id, channel_name, *kind_params),
         )
 
         # Separate into compaction summaries and normal messages
@@ -276,7 +292,8 @@ class SessionManager:
         channel_name: str = "feishu",
         workspace_dir: str | None = None,
         message_kind: str = "normal",
-    ) -> None:
+        metadata: dict[str, Any] | None = None,
+    ) -> int | None:
         """Persist a message to the history store.
 
         Phase 9 P0.6: ``channel_name`` and ``workspace_dir`` must be provided
@@ -285,20 +302,43 @@ class SessionManager:
 
         Phase 9 M9.1: Also mirrors to messages_fts for chat_search.
         Phase 9.7: ``message_kind`` in ('normal', 'prelude') marks preludes for UI filtering.
+        Phase 10 M10.1: ``message_kind='react_update'`` is the new process-message
+        kind that replaces prelude in the new flow; ``metadata`` carries the
+        ReActUserUpdate ID + step ID + event type for the trace layer.
+
+        Returns the inserted ``messages.id`` for callers that need to wire the
+        new row into other tables (e.g. tool_calls, react_user_updates).
         """
         workspace_dir_str = str(workspace_dir) if workspace_dir is not None else None
 
         now = int(time.time())
+        import json as _json
+
+        metadata_json = _json.dumps(metadata, ensure_ascii=False) if metadata else None
         cursor = self._storage.execute(
             "INSERT INTO messages (chat_id, agent_id, run_id, role, content, created_at, "
-            "channel_name, workspace_dir, workspace_dir_inferred, message_kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, agent_id, run_id, role, content, now, channel_name, workspace_dir_str, 0, message_kind),
+            "channel_name, workspace_dir, workspace_dir_inferred, message_kind, metadata_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chat_id,
+                agent_id,
+                run_id,
+                role,
+                content,
+                now,
+                channel_name,
+                workspace_dir_str,
+                0,
+                message_kind,
+                metadata_json,
+            ),
         )
         message_id = cursor.lastrowid
 
-        # Phase 9 M9.1: mirror to messages_fts (silent failure if FTS5 unavailable)
-        if message_id and content:
+        # Phase 9 M9.1: mirror to messages_fts (silent failure if FTS5 unavailable).
+        # Phase 10: do NOT mirror process-only kinds (prelude / react_update) —
+        # they must not surface in /chat search results.
+        if message_id and content and message_kind not in {"prelude", "react_update"}:
             from mini_claw.chat_search.indexer import index_message_row
             try:
                 session_id = derive_session_id(channel_name, chat_id, agent_id)
@@ -317,6 +357,7 @@ class SessionManager:
             except Exception:
                 # Mirror failures must not block message persistence
                 pass
+        return message_id
 
     def count_messages(
         self, chat_id: str, agent_id: str, channel_name: str = "feishu"
@@ -328,6 +369,29 @@ class SessionManager:
         should be aware that summaries contribute to the total.
 
         Phase 9 P0.6: Strict channel_name matching enforced (legacy compatibility removed).
+        Phase 10 M10.1: process-only message_kind values (prelude / react_update)
+        do not contribute toward the auto-compaction threshold.
+        """
+        row = self._storage.fetchone(
+            "SELECT COUNT(*) AS cnt FROM messages "
+            "WHERE chat_id = ? AND agent_id = ? "
+            "AND channel_name = ? "
+            "AND COALESCE(message_kind, 'normal') NOT IN ('prelude', 'react_update') "
+            "AND COALESCE(compacted, 0) = 0",
+            (chat_id, agent_id, channel_name),
+        )
+        if not row:
+            return 0
+        return int(row["cnt"] or 0)
+
+    def clear_history(
+        self, chat_id: str, agent_id: str, channel_name: str = "feishu"
+    ) -> int:
+        """Hide the active conversation history for one chat/agent/channel.
+
+        This is a logical clear, not a physical delete: old rows stay in the
+        database for audit/search, but future ``get_history`` calls will not
+        replay them into the model context.
         """
         row = self._storage.fetchone(
             "SELECT COUNT(*) AS cnt FROM messages "
@@ -336,9 +400,17 @@ class SessionManager:
             "AND COALESCE(compacted, 0) = 0",
             (chat_id, agent_id, channel_name),
         )
-        if not row:
+        count = int(row["cnt"] or 0) if row else 0
+        if count <= 0:
             return 0
-        return int(row["cnt"] or 0)
+        self._storage.execute(
+            "UPDATE messages SET compacted = 1 "
+            "WHERE chat_id = ? AND agent_id = ? "
+            "AND channel_name = ? "
+            "AND COALESCE(compacted, 0) = 0",
+            (chat_id, agent_id, channel_name),
+        )
+        return count
 
     # ------------------------------------------------------------------
     # History compaction
@@ -381,11 +453,14 @@ class SessionManager:
 
         # Identify candidates: non-compacted, ordered newest-first so we can
         # carve off the recent window cleanly.
+        # Phase 10 M10.1: process-only kinds never enter compaction —
+        # they are user-visible mirrors, not facts.
         active_rows = self._storage.fetchall(
             "SELECT id, role, content, tool_calls, tool_call_id, run_id, "
             "is_compaction_summary "
             "FROM messages "
             "WHERE chat_id = ? AND agent_id = ? "
+            "AND COALESCE(message_kind, 'normal') NOT IN ('prelude', 'react_update') "
             "AND COALESCE(compacted, 0) = 0 "
             "ORDER BY created_at DESC, id DESC",
             (chat_id, agent_id),

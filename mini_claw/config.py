@@ -254,6 +254,121 @@ class WorkflowConfig(BaseModel):
     prompt_review: WorkflowPromptReviewConfig = Field(
         default_factory=WorkflowPromptReviewConfig
     )
+    # Phase 10 §6: per-node ReAct defaults consumed by
+    # ``mini_claw.workflow.runner.WorkflowRunner._run_node`` via
+    # ``mini_claw.agent.react_policy.resolve_react_policy``.
+    node_defaults: "WorkflowNodeReactDefaults" = Field(
+        default_factory=lambda: WorkflowNodeReactDefaults()
+    )
+    high_risk_node_defaults: "WorkflowHighRiskNodeReactDefaults" = Field(
+        default_factory=lambda: WorkflowHighRiskNodeReactDefaults()
+    )
+
+
+class WorkflowNodeReactDefaults(BaseModel):
+    """``workflow.node_defaults.react_mode`` per Phase 10 §6.
+
+    Default ReAct mode applied to every node unless its
+    ``react_policy`` overrides or the node's ``risk_level == 'high'``
+    bumps it via ``high_risk_node_defaults``.
+    """
+
+    react_mode: Literal["controlled", "strict"] = "controlled"
+
+
+class WorkflowHighRiskNodeReactDefaults(BaseModel):
+    """``workflow.high_risk_node_defaults`` per Phase 10 §6."""
+
+    react_mode: Literal["controlled", "strict"] = "strict"
+    reflect_every_iteration: bool = True
+
+
+# ===========================================================================
+# Phase 10: Goal Anchor / ReActUserUpdate / ReAct policy configuration.
+# ===========================================================================
+
+
+class GoalAnchorConfig(BaseModel):
+    """``agent.goal_anchor`` per plans/ReAct.md §6."""
+
+    enabled: bool = True
+    inject_every_iteration: bool = True
+    max_summary_chars: int = 800
+    summarization_mode: Literal["truncate"] = "truncate"
+    mark_untrusted: bool = True
+    detect_policy_like_phrases: bool = True
+
+
+class ReactUserUpdatesConfig(BaseModel):
+    """``agent.react_user_updates`` per plans/ReAct.md §6.
+
+    ``mode`` is the only display switch — there are no per-event_type
+    ``send_*`` toggles (verifies acceptance criterion #18).
+    """
+
+    enabled: bool = True
+    mode: Literal["silent", "normal", "verbose", "debug"] = "normal"
+    max_update_chars: int = 160
+    sanitize_completion_claims: bool = True
+    store_redacted_text: bool = True
+    send_failure_non_blocking: bool = True
+
+
+class ReactControlledConfig(BaseModel):
+    """``agent.react.controlled`` per plans/ReAct.md §6."""
+
+    reflect_every_iteration: bool = False
+    reflect_before_finalize: bool = True
+    reflect_before_finalize_mode: Literal["deterministic_first", "always"] = "deterministic_first"
+
+    reflect_on_tool_error: bool = True
+    reflect_on_permission_denied: bool = True
+    reflect_on_approval_rejected: bool = True
+    reflect_on_chain_blocked: bool = True
+    reflect_on_repeated_tool_call: bool = True
+    reflect_on_hallucination_guard: bool = True
+    reflect_on_empty_rag_result: bool = True
+
+    reflect_on_iteration_threshold: int | None = 7
+    reflect_on_iteration_threshold_ratio: float | None = 0.7
+
+
+class ReactStrictConfig(BaseModel):
+    """``agent.react.strict`` per plans/ReAct.md §6."""
+
+    reflect_every_iteration: bool = True
+    reflect_before_finalize: bool = True
+
+
+class ReactConfig(BaseModel):
+    """``agent.react`` per plans/ReAct.md §6."""
+
+    enabled: bool = True
+    default_mode: Literal["controlled", "strict"] = "controlled"
+    controlled: ReactControlledConfig = Field(default_factory=ReactControlledConfig)
+    strict: ReactStrictConfig = Field(default_factory=ReactStrictConfig)
+    reflection_timeout_sec: int = 15
+    max_reflection_chars: int = 4000
+    max_observation_chars: int = 2500
+    store_reflection: bool = True
+    finalizer_enabled: bool = True
+    finalizer_timeout_sec: int = 20
+
+
+class AgentRuntimeConfig(BaseModel):
+    """``agent`` block per plans/ReAct.md §6.
+
+    Top-level container for Phase 10 runtime knobs. These defaults take
+    effect at gateway construction time so the AgentLoop and
+    WorkflowRunner inherit a consistent policy without ad-hoc plumbing
+    in the router.
+    """
+
+    goal_anchor: GoalAnchorConfig = Field(default_factory=GoalAnchorConfig)
+    react_user_updates: ReactUserUpdatesConfig = Field(
+        default_factory=ReactUserUpdatesConfig
+    )
+    react: ReactConfig = Field(default_factory=ReactConfig)
 
 
 class AgentConfig(BaseModel):
@@ -499,6 +614,11 @@ class AppConfig(BaseModel):
     # Phase 9: top-level memory config (mirrors rag.memory_control / rag.memory_maintenance
     # for forward-compatibility with the planned YAML structure).
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    # Phase 10 §6: agent-level runtime knobs (goal anchor + react user
+    # updates + react policy). The router reads this block when it
+    # constructs AgentContext so the AgentLoop and WorkflowRunner share
+    # a single source of truth.
+    agent: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
     agents_defaults: AgentConfig | None = None
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
 

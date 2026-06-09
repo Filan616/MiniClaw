@@ -76,6 +76,14 @@ class Gateway:
                 "Gateway requires registry, permission_gate, result_processor, and workspace_manager"
             )
         self._config = config
+        # Phase 10 §6: WorkflowRunner needs to reach the unified
+        # ``cfg.agent.react`` block when resolving per-node ReActPolicy.
+        # Stash a reverse pointer so it can read it without changing the
+        # public WorkflowConfig surface.
+        try:
+            self._config.workflow._app_config = self._config  # type: ignore[attr-defined]
+        except Exception:
+            pass
         self._storage = storage
         self._provider_manager = provider_manager or ProviderManager(config, default_provider=provider)
         self._agent_manager = agent_manager
@@ -233,10 +241,13 @@ class Gateway:
         run_id: str,
         text: str,
     ) -> None:
-        """Phase 9.7: Send prelude to user and store with message_kind='prelude'.
+        """Phase 9.7 (legacy): Send prelude to user and store with message_kind='prelude'.
 
-        Called by AgentLoop when the first tool call has accompanying text.
-        Fire-and-forget: failures are logged but do not interrupt tool execution.
+        DEPRECATED for AgentLoop usage — Phase 10 M10.1 routes process
+        messages through ``_send_react_user_update``. Kept for command
+        helpers that haven't been migrated to ReActUserUpdate (eg.
+        ``/context index`` prelude templates) and for backwards-compat
+        bridging in tests that bind ``on_prelude`` directly.
         """
         try:
             await channel.send(chat_id, text)
@@ -256,6 +267,95 @@ class Gateway:
                 exc_info=True,
                 extra={"chat_id": chat_id, "run_id": run_id},
             )
+
+    async def _send_react_user_update(
+        self,
+        chat_id: str,
+        agent_id: str,
+        channel: Channel,
+        channel_name: str,
+        workspace_dir: str,
+        run_id: str,
+        update: Any,
+    ) -> bool:
+        """Phase 10 M10.1: deliver a ReActUserUpdate to the user.
+
+        Sends ``update.text`` over the channel, persists the row to
+        ``react_user_updates`` (so the trace layer sees it), and mirrors
+        the update as a ``messages.message_kind='react_update'`` row with
+        the (update_id, step_id, event_type, ...) blob in metadata_json.
+
+        Returns True iff the channel send completed successfully. Storage
+        always runs — even on send failure — so audit / trace remain
+        complete.
+        """
+        from mini_claw.agent.react_update import store_react_update
+
+        send_ok = False
+        try:
+            await channel.send(chat_id, update.text)
+            send_ok = True
+            update.send_status = "sent"
+            update.sent_at = int(time.time())
+        except Exception:
+            update.send_status = "failed"
+            logger.warning(
+                "react_user_update send failed",
+                exc_info=True,
+                extra={"chat_id": chat_id, "run_id": run_id, "update_id": update.update_id},
+            )
+
+        store_react_update(
+            self._storage,
+            update,
+            store_redacted_text=self._config.agent.react_user_updates.store_redacted_text,
+        )
+
+        try:
+            self._session_mgr.store_message(
+                chat_id=chat_id,
+                agent_id=agent_id,
+                role="assistant",
+                content=update.text,
+                run_id=run_id,
+                channel_name=channel_name,
+                workspace_dir=workspace_dir,
+                message_kind="react_update",
+                metadata={
+                    "react_update_id": update.update_id,
+                    "react_step_id": update.step_id,
+                    "react_event_type": update.event_type,
+                    "visible_level": update.visible_level,
+                    "is_important": bool(update.is_important),
+                },
+            )
+        except Exception:
+            logger.warning(
+                "react_user_update mirror failed",
+                exc_info=True,
+                extra={"chat_id": chat_id, "run_id": run_id, "update_id": update.update_id},
+            )
+
+        if self._audit_logger:
+            try:
+                self._audit_logger.log_security_event(
+                    event_type="react_user_update_created",
+                    details={
+                        "run_id": run_id,
+                        "step_id": update.step_id,
+                        "update_id": update.update_id,
+                        "event_type": update.event_type,
+                        "text_hash": update.text_hash,
+                        "is_important": bool(update.is_important),
+                        "send_status": update.send_status,
+                    },
+                    chat_id=chat_id,
+                    agent_id=agent_id,
+                )
+            except Exception:
+                pass
+
+        return send_ok
 
     async def _send_progress(
         self,
@@ -461,13 +561,22 @@ class Gateway:
         total_tokens = prompt_tokens + completion_tokens
         self._storage.execute(
             "UPDATE agent_runs SET status=?, final_answer=?, iterations=?, "
-            "pending_tool_call=?, total_tokens=?, updated_at=? WHERE id=?",
+            "pending_tool_call=?, total_tokens=?, "
+            "react_mode=COALESCE(?, react_mode), "
+            "original_goal_raw=COALESCE(?, original_goal_raw), "
+            "original_goal_summary=COALESCE(?, original_goal_summary), "
+            "final_reflection_json=COALESCE(?, final_reflection_json), "
+            "updated_at=? WHERE id=?",
             (
                 _status_value(run.status),
                 run.final_answer,
                 run.iterations,
                 run.pending_tool_call,
                 total_tokens,
+                getattr(ctx.react_policy, "mode", None) if getattr(ctx, "react_policy", None) else None,
+                getattr(run, "original_goal_raw", None),
+                getattr(run, "original_goal_summary", None),
+                getattr(run, "final_reflection_json", None),
                 now,
                 run_id,
             ),
@@ -734,6 +843,17 @@ class Gateway:
                 agent_id=agent_id,
                 thread_id=None,  # TODO: extract from msg if threading supported
             )
+            # Phase 10 §6: pull all runtime knobs from cfg.agent so we
+            # don't hardcode mode/enabled/max_chars at every call site,
+            # and resolve a default ReActPolicy so the standard router
+            # flow really does enter the controlled ReAct path.
+            agent_runtime = self._config.agent
+            from mini_claw.agent.react_policy import resolve_react_policy
+
+            default_react_policy = resolve_react_policy(
+                config=agent_runtime.react,
+            )
+
             ctx = AgentContext(
                 chat_id=msg.chat_id,
                 agent_id=agent_id,
@@ -749,15 +869,25 @@ class Gateway:
                 session_id=session_id,
                 channel_name=channel_name,
                 chat_search_manager=self._chat_search_manager,
-                on_prelude=lambda text: self._send_prelude(
+                # Phase 10 M10.1: bind ReActUserUpdate callback. The legacy
+                # ``on_prelude`` path is deliberately NOT wired here so
+                # message_kind='prelude' rows are no longer produced by the
+                # main flow (only the legacy command helpers still use it).
+                on_react_update=lambda update: self._send_react_user_update(
                     chat_id=msg.chat_id,
                     agent_id=agent_id,
                     channel=channel,
                     channel_name=channel_name,
-                    workspace_dir=workspace_dir,
+                    workspace_dir=str(workspace_dir) if workspace_dir else "",
                     run_id=run_id,
-                    text=text,
+                    update=update,
                 ),
+                react_user_updates_enabled=agent_runtime.react_user_updates.enabled,
+                react_user_update_mode=agent_runtime.react_user_updates.mode,
+                react_user_update_max_chars=agent_runtime.react_user_updates.max_update_chars,
+                react_user_updates_sanitize_completion_claims=agent_runtime.react_user_updates.sanitize_completion_claims,
+                react_user_updates_store_redacted_text=agent_runtime.react_user_updates.store_redacted_text,
+                react_user_updates_send_failure_non_blocking=agent_runtime.react_user_updates.send_failure_non_blocking,
                 on_progress=lambda text: self._send_progress(
                     chat_id=msg.chat_id,
                     agent_id=agent_id,
@@ -767,7 +897,13 @@ class Gateway:
                     run_id=run_id,
                     text=text,
                 ),
-                prelude_max_length=500,
+                react_policy=default_react_policy,
+                goal_anchor_enabled=agent_runtime.goal_anchor.enabled,
+                goal_anchor_max_summary_chars=agent_runtime.goal_anchor.max_summary_chars,
+                goal_anchor_mark_untrusted=agent_runtime.goal_anchor.mark_untrusted,
+                goal_anchor_detect_policy=agent_runtime.goal_anchor.detect_policy_like_phrases,
+                goal_anchor_inject_every_iteration=agent_runtime.goal_anchor.inject_every_iteration,
+                goal_anchor_summarization_mode=agent_runtime.goal_anchor.summarization_mode,
             )
 
             # Load conversation history for context
@@ -783,7 +919,17 @@ class Gateway:
                 status=RunOutcome.DONE,
                 messages=messages,
                 allowed_tools=agent_cfg.tools,
+                original_goal_raw=msg.text,
             )
+
+            # Phase 10: persist the original goal on agent_runs row.
+            try:
+                self._storage.execute(
+                    "UPDATE agent_runs SET original_goal_raw=? WHERE id=?",
+                    (msg.text, run_id),
+                )
+            except Exception:
+                pass
 
             # Update job to running
             self._storage.execute(
@@ -913,16 +1059,30 @@ class Gateway:
             ),
             channel_name=channel_name,
             chat_search_manager=self._chat_search_manager,
-            on_prelude=lambda text: self._send_prelude(
+            on_react_update=lambda update: self._send_react_user_update(
                 chat_id=run_row["chat_id"],
                 agent_id=run_row["agent_id"],
                 channel=channel,
                 channel_name=channel_name,
-                workspace_dir=workspace_dir,
+                workspace_dir=str(workspace_dir) if workspace_dir else "",
                 run_id=run_row["id"],
-                text=text,
+                update=update,
             ),
-            prelude_max_length=500,
+            react_user_updates_enabled=self._config.agent.react_user_updates.enabled,
+            react_user_update_mode=self._config.agent.react_user_updates.mode,
+            react_user_update_max_chars=self._config.agent.react_user_updates.max_update_chars,
+            react_user_updates_sanitize_completion_claims=self._config.agent.react_user_updates.sanitize_completion_claims,
+            react_user_updates_store_redacted_text=self._config.agent.react_user_updates.store_redacted_text,
+            react_user_updates_send_failure_non_blocking=self._config.agent.react_user_updates.send_failure_non_blocking,
+            react_policy=__import__("mini_claw.agent.react_policy", fromlist=["resolve_react_policy"]).resolve_react_policy(
+                config=self._config.agent.react,
+            ),
+            goal_anchor_enabled=self._config.agent.goal_anchor.enabled,
+            goal_anchor_max_summary_chars=self._config.agent.goal_anchor.max_summary_chars,
+            goal_anchor_mark_untrusted=self._config.agent.goal_anchor.mark_untrusted,
+            goal_anchor_detect_policy=self._config.agent.goal_anchor.detect_policy_like_phrases,
+            goal_anchor_inject_every_iteration=self._config.agent.goal_anchor.inject_every_iteration,
+            goal_anchor_summarization_mode=self._config.agent.goal_anchor.summarization_mode,
         )
 
         history = self._session_mgr.get_history(
@@ -966,9 +1126,20 @@ class Gateway:
             total_tokens_resume = prompt_tokens_resume + completion_tokens_resume
             self._storage.execute(
                 "UPDATE agent_runs SET status = ?, final_answer = ?, iterations = ?, "
-                "total_tokens = ?, updated_at = ? WHERE id = ?",
-                (_status_value(run.status), run.final_answer, run.iterations,
-                 total_tokens_resume, int(time.time()), run.id),
+                "total_tokens = ?, "
+                "original_goal_summary=COALESCE(?, original_goal_summary), "
+                "final_reflection_json=COALESCE(?, final_reflection_json), "
+                "updated_at = ? WHERE id = ?",
+                (
+                    _status_value(run.status),
+                    run.final_answer,
+                    run.iterations,
+                    total_tokens_resume,
+                    getattr(run, "original_goal_summary", None),
+                    getattr(run, "final_reflection_json", None),
+                    int(time.time()),
+                    run.id,
+                ),
             )
 
         # ========== Resume run with workspace lock ==========
@@ -997,6 +1168,7 @@ class Gateway:
         * ``/goal <text>``    — overwrite the task description / goal.
         * ``/tasks``          — render the current TaskState back to the user.
         * ``/compact``        — manually trigger history compaction.
+        * ``/clear``          — clear active chat history without calling LLM.
 
         Returns ``True`` when the message was recognized as a TaskState
         command (regardless of whether the payload was valid), so the caller
@@ -1073,6 +1245,22 @@ class Gateway:
             await channel.send(msg.chat_id, "\n".join(lines))
             return True
 
+        if head == "/clear":
+            if argument:
+                await channel.send(msg.chat_id, "用法：`/clear`")
+                return True
+            channel_name = getattr(msg, "channel_name", "feishu")
+            cleared = self._session_mgr.clear_history(
+                msg.chat_id,
+                agent_id,
+                channel_name=channel_name,
+            )
+            await channel.send(
+                msg.chat_id,
+                f"已清理当前会话上下文（隐藏 {cleared} 条活跃历史消息）。RAG、长期 memory 和审计记录不会被删除。",
+            )
+            return True
+
         if head == "/compact":
             keep_recent = AUTO_COMPACT_KEEP_RECENT
             # Allow `/compact <n>` to override the keep_recent window.
@@ -1110,7 +1298,62 @@ class Gateway:
                 )
             return True
 
+        # Phase 10 M10.4: /run trace <run_id> | /run inspect <run_id>
+        if head == "/run":
+            return await self._handle_run_command(msg, channel, argument)
+
         return False
+
+    async def _handle_run_command(
+        self,
+        msg: "InboundMessage",
+        channel: "Channel",
+        argument: str,
+    ) -> bool:
+        """Phase 10 M10.4: /run list | /run trace <id> | /run inspect <id>."""
+        from mini_claw.agent.trace import build_run_trace, render_trace_text
+
+        if not argument:
+            await channel.send(
+                msg.chat_id,
+                "Usage: /run list | /run trace <run_id> | /run inspect <run_id>",
+            )
+            return True
+
+        parts = argument.split(maxsplit=1)
+        sub = parts[0].lower()
+        target = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub == "list":
+            rows = self._storage.fetchall(
+                "SELECT id, status, iterations, created_at FROM agent_runs "
+                "WHERE chat_id=? ORDER BY created_at DESC LIMIT 20",
+                (msg.chat_id,),
+            )
+            if not rows:
+                await channel.send(msg.chat_id, "(no recent runs)")
+                return True
+            lines = [f"Recent runs ({len(rows)}):"]
+            for r in rows:
+                lines.append(
+                    f"- {r['id']} status={r['status']} iters={r.get('iterations', 0)}"
+                )
+            await channel.send(msg.chat_id, "\n".join(lines))
+            return True
+
+        if sub in {"trace", "inspect"}:
+            if not target:
+                await channel.send(msg.chat_id, f"Usage: /run {sub} <run_id>")
+                return True
+            trace = build_run_trace(self._storage, target, audit_logger=self._audit_logger)
+            if trace is None:
+                await channel.send(msg.chat_id, f"Run not found: {target}")
+                return True
+            await channel.send(msg.chat_id, render_trace_text(trace))
+            return True
+
+        await channel.send(msg.chat_id, f"Unknown /run subcommand: {sub}")
+        return True
 
     # ------------------------------------------------------------------
     # Phase 8 M2: /context commands
@@ -3121,10 +3364,15 @@ class Gateway:
         ):
             return
         try:
-            # Fetch messages compacted in the just-completed pass
+            # Fetch messages compacted in the just-completed pass.
+            # Phase 10 M10.1: process-only kinds (prelude / react_update) are
+            # never extracted into Memory candidates — they are user-facing
+            # process echoes, not facts.
             rows = self._storage.fetchall(
                 "SELECT id, role, content FROM messages "
-                "WHERE chat_id = ? AND agent_id = ? AND channel_name = ? AND COALESCE(compacted, 0) = 1 "
+                "WHERE chat_id = ? AND agent_id = ? AND channel_name = ? "
+                "AND COALESCE(compacted, 0) = 1 "
+                "AND COALESCE(message_kind, 'normal') NOT IN ('prelude', 'react_update') "
                 "ORDER BY created_at DESC LIMIT 50",
                 (chat_id, agent_id, channel_name),
             )
@@ -3492,7 +3740,16 @@ class Gateway:
             return True
 
         if command == "inspect":
-            await channel.send(msg.chat_id, self._render_workflow_inspect(argument))
+            # Phase 10 M10.4: ``/workflow inspect <id> --trace`` renders a
+            # node-by-node ReAct trace pulling each node's agent_run_id from
+            # workflow_nodes and resolving its react_steps + user_updates.
+            tokens = argument.split()
+            wf_id = tokens[0] if tokens else ""
+            want_trace = "--trace" in tokens
+            if want_trace:
+                await channel.send(msg.chat_id, self._render_workflow_trace(wf_id))
+            else:
+                await channel.send(msg.chat_id, self._render_workflow_inspect(wf_id))
             return True
 
         await channel.send(msg.chat_id, f"Unknown workflow command: {command}")
@@ -3879,6 +4136,44 @@ class Gateway:
             "prompts": prompts,
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _render_workflow_trace(self, workflow_id: str) -> str:
+        """Phase 10 M10.4: render a workflow's per-node ReAct trace.
+
+        Walks ``workflow_nodes``, picks each node's ``agent_run_id`` and
+        renders that run via :func:`mini_claw.agent.trace.render_trace_text`.
+        Nodes without an agent run (eg. merge nodes) appear as a header
+        line only.
+        """
+        from mini_claw.agent.trace import build_run_trace, render_trace_text
+
+        if not workflow_id:
+            return "Usage: /workflow inspect <workflow_id> --trace"
+        row = self._workflow_store.get_run(workflow_id)
+        if row is None:
+            return f"Workflow not found: {workflow_id}"
+        nodes = self._workflow_store.list_nodes(workflow_id)
+
+        lines = [f"Workflow {workflow_id}: {row['status']}", ""]
+        for node in nodes:
+            node_id = node.get("node_id")
+            status = node.get("status") or "?"
+            run_id = node.get("agent_run_id")
+            lines.append(f"▸ Node {node_id} ({status})")
+            if not run_id:
+                lines.append("  (no agent run — merge/skipped node)")
+                lines.append("")
+                continue
+            trace = build_run_trace(self._storage, run_id, audit_logger=getattr(self, "_audit_logger", None))
+            if trace is None:
+                lines.append(f"  (agent run {run_id} not found)")
+            else:
+                indented = "\n".join(
+                    "  " + ln for ln in render_trace_text(trace).splitlines()
+                )
+                lines.append(indented)
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
 
     def _resolve_agent(self, chat_id: str, channel_name: str = "feishu") -> AgentConfig:
         """Determine which agent config handles a given chat_id."""

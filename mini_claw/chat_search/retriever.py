@@ -218,6 +218,7 @@ class ChatSearchRetriever:
             SELECT id, role, content, created_at, chat_id, agent_id, channel_name
             FROM messages
             WHERE content LIKE ? AND {where_clause}
+              AND COALESCE(message_kind, 'normal') NOT IN ('prelude', 'react_update')
             ORDER BY created_at DESC
             LIMIT ?
             """,

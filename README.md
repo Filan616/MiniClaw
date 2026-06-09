@@ -2,9 +2,9 @@
 
 > 本地优先的个人 AI Agent Gateway
 
-支持飞书与 CLI 双通道入口，内置 LLM agent loop、工具系统、5 级权限、L3 审批、攻击链检测、Skills/Plugin 扩展、Phase 5 受控 Workflow 编排（含 Phase 7 自动触发 + prompt_reviewer 审查）、**Phase 8 完整 RAG 子系统（Context + Memory + 向量后端 + 健康观测）**，以及 **Phase 9 成熟 Memory 系统（Chat Search + Workspace Memory + Maintenance + 跨 Channel 隔离）**。所有事件、审批、审计、会话状态、RAG 索引都持久化到本地 SQLite。
+支持飞书与 CLI 双通道入口，内置 LLM agent loop、工具系统、5 级权限、L3 审批、攻击链检测、Skills/Plugin 扩展、Phase 5 受控 Workflow 编排（含 Phase 7 自动触发 + prompt_reviewer 审查）、**Phase 8 完整 RAG 子系统（Context + Memory + 向量后端 + 健康观测）**、**Phase 9 成熟 Memory 系统（Chat Search + Workspace Memory + Maintenance + 跨 Channel 隔离）**，以及 **Phase 10 Goal-anchored Controlled ReAct Runtime（Goal Anchor + ReActUserUpdate + Controlled Reflection + Node-level Strict ReAct + RunTraceView）**。所有事件、审批、审计、会话状态、RAG 索引都持久化到本地 SQLite。
 
-**当前状态**：Phase 0-9 完整落地，`pytest tests/ -q` 为 **652/652** 通过（+ 4 skip）。详尽实现讲解见 [`LEARNING.md`](LEARNING.md)（5000+ 行深度文档，覆盖 187 个实现细节）。
+**当前状态**：Phase 0-10 完整落地。Phase 10 相关回归测试当前通过，包括 `tests/test_phase10_complete.py`、`tests/test_phase10_wiring.py`、`tests/test_react_loop_integration.py`、`tests/test_react_policy.py`、`tests/test_react_reflection.py`、`tests/test_react_trace.py`、`tests/test_react_user_update.py`、`tests/test_phase10_knobs.py`。详尽实现讲解见 [`LEARNING.md`](LEARNING.md)。
 
 ## 快速开始
 
@@ -84,11 +84,29 @@ Agent Loop / Workflow Runner
 Tools / SQLite / Workspace / Vector Backend (Chroma optional) / Chat Search (FTS5)
 ```
 
+Phase 10 在 Agent Loop / Workflow Runner 内再加了一层受控状态管理：
+
+```text
+Goal Anchor
+  ↓
+Action Planning
+  ↓
+ReActUserUpdate(action_planned)
+  ↓
+Tool Execution
+  ↓
+Observation
+  ↓
+should_reflect()
+  ├── false → 下一轮 Action / Finalizer
+  └── true  → Reflection → DecisionController → Finalizer / Continue / Block / Suspend
+```
+
 ## 模块
 
 | 模块 | 职责 |
 |---|---|
-| `agent/` | AgentLoop、AgentContext、TaskState、WorkspaceManager |
+| `agent/` | AgentLoop、AgentContext、TaskState、WorkspaceManager、Goal Anchor、Reflection、RunTrace 聚合 |
 | `audit/` | SecurityAuditLogger，事件入 `security_audit` 表 |
 | `channels/` | Channel 抽象 + Feishu/CLI 实现 + ChannelManager |
 | `commands/` | `/bypass /safe /pin /goal /tasks /compact` 等斜杠命令 |
@@ -97,7 +115,7 @@ Tools / SQLite / Workspace / Vector Backend (Chroma optional) / Chat Search (FTS
 | `plugins/` | PluginManager（manifest + 静态扫描 + integrity hash + 热摘除）|
 | `providers/` | LLM provider 抽象（DeepSeek / OpenAI / Ollama）+ Health Check + Fallback |
 | `skills/` | Prompt-only SkillManager + 旧版 tools.py 兼容层 |
-| `storage/` | SQLite 33 张表 + 幂等迁移（Phase 8 加 6 张：rag_items / rag_chunks / rag_chunks_fts / rag_embeddings / active_contexts / memory_candidates；Phase 9 P0 扩展：workspace_dir backfill + channel 隔离 + messages_fts chat search） |
+| `storage/` | SQLite 持久化 + 幂等迁移（含 agent_runs / tool_calls / security_audit / messages / react_steps / react_user_updates / RAG / workflow / approvals 等表） |
 | `tools/` | 内置工具 + 结果压缩 + Phase 8 18 个 RAG/memory 工具 + Phase 9 chat search 工具 |
 | `workflow/` | WorkflowSpec / Planner / PromptCompiler / Runner / Scheduler / Merger / reviewer_inject |
 | `rag/` | **Phase 8**：models / store / chunker / indexer / retriever / hybrid / lifecycle / reindex / injector / query_router / embeddings / vector_backend / health / permissions / redaction |
@@ -117,6 +135,9 @@ cp config.example.yaml config.yaml
 - `agents` / `agents_defaults` — 多 agent 配置、独立 workspace、provider/model 覆盖、`provider_fallback` 列表
 - `permissions` — 5 级权限、shell 黑名单、sandbox mode、`chain_detector.session_scope`
 - `workflow` — `enabled` / `auto_detect` / `prompt_review` / 节点上限等
+- `agent.goal_anchor` — Phase 10：`enabled` / `inject_every_iteration` / `max_summary_chars` / `summarization_mode` / `mark_untrusted` / `detect_policy_like_phrases`
+- `agent.react_user_updates` — Phase 10：`enabled` / `mode`（`silent|normal|verbose|debug`）/ `max_update_chars` / `sanitize_completion_claims` / `store_redacted_text`
+- `agent.react` — Phase 10：`default_mode`（`controlled|strict`）/ `controlled.*` / `strict.*` / `reflection_timeout_sec` / `max_reflection_chars` / `max_observation_chars` / `store_reflection` / `finalizer_enabled`
 - `plugins.integrity_mode` — `strict` 拒绝 hash mismatch，`warn` 仅记录
 - `concurrency.lock_backend` — `asyncio` 单进程、`file` 多进程
 - `rag` — Phase 8：`enabled` / `namespaces.context_enabled` / `namespaces.memory_enabled` / `backend.vector_backend` / `backend.hybrid_enabled` / `embedding` / `retrieval.auto_*_retrieval` / `lifecycle` / `chroma.persist_dir`，**全部出厂 False**
@@ -149,6 +170,7 @@ cp config.example.yaml config.yaml
 /workflow reject  <workflow_id>
 /workflow status  <workflow_id>
 /workflow inspect <workflow_id>
+/workflow inspect <workflow_id> --trace
 ```
 
 自动触发（Phase 7）：
@@ -235,6 +257,58 @@ rag:
 /chat search <query>                 # FTS5 搜索历史对话（支持 scope/limit/keyword_class）
 /chat rebuild                        # 重建 messages_fts 索引（维护用）
 ```
+
+## ReAct Runtime（Phase 10）
+
+Phase 10 把原来的 `tool_calls loop` 升级为带状态管理的受控运行时，但不把系统变成“裸 ReAct agent”。
+
+核心能力：
+
+- `Goal Anchor`：每轮把原始目标重新注入到系统提示，默认不额外调用 LLM，只做截断和 policy-like phrase warning
+- `ReActUserUpdate`：统一替代旧 prelude，所有过程消息走 `react_user_updates`，并镜像到 `messages.message_kind='react_update'`
+- `Controlled Reflection`：仅在失败、阻断、审批拒绝、循环风险、最终收敛前等条件下触发结构化 Reflection
+- `Node-level Strict ReAct`：高风险 workflow node 可开启每轮 Observation / Reflection / Decision
+- `RunTraceView`：聚合 `agent_runs / tool_calls / security_audit / messages / react_steps / react_user_updates`
+
+运行时大致形态：
+
+```text
+普通 AgentLoop
+  Goal Anchor
+    -> Action Planning
+    -> ReActUserUpdate(action_planned)
+    -> Tool Execution
+    -> Observation
+    -> should_reflect()
+       -> continue / finalize / block / suspend
+
+高风险 Workflow Node
+  Goal Anchor
+    -> Action
+    -> Observation
+    -> Reflection
+    -> Decision
+```
+
+Phase 10 还引入了两张关键表：
+
+- `react_steps`：每个 step 的 action/observation/reflection/decision 骨架
+- `react_user_updates`：用户可见过程消息事实源
+
+可观察性命令：
+
+```text
+/run list
+/run inspect <run_id>
+/run trace <run_id>
+/workflow inspect <workflow_id> --trace
+```
+
+说明：
+
+- `react_update` 不进入普通会话历史、Chat Search、Memory Extractor 和 `compact_history`
+- 历史 `message_kind='prelude'` 不批量迁移，但会在 trace 层兼容显示
+- Reflection 不带 tools，且不暴露完整 chain-of-thought
 
 ### Workspace Memory（Phase 9 M9.3）
 
